@@ -22,8 +22,7 @@
 # 三、项目设计
 
 ## 总体设计
-
-![总体架构图](../pic/XXL-JOB-OverALL.png)
+![总体架构图](../pic/XXL-RPC-OverALL.png)
 
 ## 关键点分析
 
