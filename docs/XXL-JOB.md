@@ -9,6 +9,9 @@
         * [3.2.1 调度中心和执行器怎么通讯](#321-调度中心和执行器怎么通讯)  
         * [3.2.2 调度中心怎么按时调度任务](#322-调度中心怎么按时调度任务)  
         * [3.2.3 调度中心和执行器执行任务的整个流程](#323-调度中心和执行器执行任务的整个流程)  
+        * [3.2.4 调度中心各种路由策略实现原理](#324-调度中心各种路由策略实现原理) 
+        * [3.2.5 调度中心页面中查看执行日志如何实现Rolling实时日志](#325-调度中心页面中查看执行日志如何实现Rolling实时日志)
+        * [3.2.6 GLUE模式(Java)任务如何实现](#326-GLUE模式Java任务如何实现)
 * [四、其他](#四其他)
 
 # 一、项目概览
@@ -141,112 +144,112 @@ public class DemoJobHandler extends IJobHandler {
  
  ``` 
 public Object getObject() {
-    return Proxy.newProxyInstance(Thread.currentThread()
-            .getContextClassLoader(), new Class[] { iface },
-            new InvocationHandler() {
-                @Override
-                public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-                    String className = method.getDeclaringClass().getName();
-                    // filter method like "Object.toString()"
-                    if (Object.class.getName().equals(className)) {
-                        logger.info(">>>>>>>>>>> xxl-rpc proxy class-method not support [{}.{}]", className, method.getName());
-                        throw new XxlRpcException("xxl-rpc proxy class-method not support");
-                    }    
-                    // address
-                    String address = routeAddress();
-                    if (address==null || address.trim().length()==0) {
-                        throw new XxlRpcException("xxl-rpc reference bean["+ className +"] address empty");
-                    }   
-                    // request
-                    XxlRpcRequest xxlRpcRequest = new XxlRpcRequest();
-                    xxlRpcRequest.setRequestId(UUID.randomUUID().toString());
-                    xxlRpcRequest.setCreateMillisTime(System.currentTimeMillis());
-                    xxlRpcRequest.setAccessToken(accessToken);
-                    xxlRpcRequest.setClassName(className);
-                    xxlRpcRequest.setMethodName(method.getName());
-                    xxlRpcRequest.setParameterTypes(method.getParameterTypes());
-                    xxlRpcRequest.setParameters(args);  	                    
-                    // send
-                    if (CallType.SYNC == callType) {
-                        try {
-                            // future set
-                            XxlRpcFutureResponse futureResponse = new XxlRpcFutureResponse(xxlRpcRequest, null);
+return Proxy.newProxyInstance(Thread.currentThread()
+    .getContextClassLoader(), new Class[] { iface },
+    new InvocationHandler() {
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            String className = method.getDeclaringClass().getName();
+            // filter method like "Object.toString()"
+            if (Object.class.getName().equals(className)) {
+                logger.info(">>>>>>>>>>> xxl-rpc proxy class-method not support [{}.{}]", className, method.getName());
+                throw new XxlRpcException("xxl-rpc proxy class-method not support");
+            }    
+            // address
+            String address = routeAddress();
+            if (address==null || address.trim().length()==0) {
+                throw new XxlRpcException("xxl-rpc reference bean["+ className +"] address empty");
+            }   
+            // request
+            XxlRpcRequest xxlRpcRequest = new XxlRpcRequest();
+            xxlRpcRequest.setRequestId(UUID.randomUUID().toString());
+            xxlRpcRequest.setCreateMillisTime(System.currentTimeMillis());
+            xxlRpcRequest.setAccessToken(accessToken);
+            xxlRpcRequest.setClassName(className);
+            xxlRpcRequest.setMethodName(method.getName());
+            xxlRpcRequest.setParameterTypes(method.getParameterTypes());
+            xxlRpcRequest.setParameters(args);  	                    
+            // send
+            if (CallType.SYNC == callType) {
+                try {
+                    // future set
+                    XxlRpcFutureResponse futureResponse = new XxlRpcFutureResponse(xxlRpcRequest, null);
 
-                            // do invoke
-                            client.asyncSend(address, xxlRpcRequest);
+                    // do invoke
+                    client.asyncSend(address, xxlRpcRequest);
 
-                            // future get
-                            XxlRpcResponse xxlRpcResponse = futureResponse.get(timeout, TimeUnit.MILLISECONDS);
-                            if (xxlRpcResponse.getErrorMsg() != null) {
-                                throw new XxlRpcException(xxlRpcResponse.getErrorMsg());
-                            }
-                            return xxlRpcResponse.getResult();
-                        } catch (Exception e) {
-                            logger.info(">>>>>>>>>>> xxl-job, invoke error, address:{}, XxlRpcRequest{}", address, xxlRpcRequest);
-
-                            throw (e instanceof XxlRpcException)?e:new XxlRpcException(e);
-                        } finally{
-                            // remove-InvokerFuture
-                            XxlRpcFutureResponseFactory.removeInvokerFuture(xxlRpcRequest.getRequestId());
-                        }
-                    } else if (CallType.FUTURE == callType) {
-
-                        // thread future set
-                        XxlRpcInvokeFuture invokeFuture = null;
-                        try {
-                            // future set
-                            invokeFuture = new XxlRpcInvokeFuture(new XxlRpcFutureResponse(xxlRpcRequest, null));
-                            XxlRpcInvokeFuture.setFuture(invokeFuture);
-
-                            // do invoke
-                            client.asyncSend(address, xxlRpcRequest);
-
-                            return null;
-                        } catch (Exception e) {
-                            logger.info(">>>>>>>>>>> xxl-job, invoke error, address:{}, XxlRpcRequest{}", address, xxlRpcRequest);
-
-                            // remove-InvokerFuture
-                            invokeFuture.stop();
-
-                            throw (e instanceof XxlRpcException)?e:new XxlRpcException(e);
-                        }
-
-                    } else if (CallType.CALLBACK == callType) {
-
-                        // get callback
-                        XxlRpcInvokeCallback finalInvokeCallback = invokeCallback;
-                        XxlRpcInvokeCallback threadInvokeCallback = XxlRpcInvokeCallback.getCallback();
-                        if (threadInvokeCallback != null) {
-                            finalInvokeCallback = threadInvokeCallback;
-                        }
-                        if (finalInvokeCallback == null) {
-                            throw new XxlRpcException("xxl-rpc XxlRpcInvokeCallback（CallType="+ CallType.CALLBACK.name() +"） cannot be null.");
-                        }
-
-                        try {
-                            // future set
-                            XxlRpcFutureResponse futureResponse = new XxlRpcFutureResponse(xxlRpcRequest, finalInvokeCallback);
-
-                            client.asyncSend(address, xxlRpcRequest);
-                        } catch (Exception e) {
-                            logger.info(">>>>>>>>>>> xxl-job, invoke error, address:{}, XxlRpcRequest{}", address, xxlRpcRequest);
-
-                            // future remove
-                            XxlRpcFutureResponseFactory.removeInvokerFuture(xxlRpcRequest.getRequestId());
-
-                            throw (e instanceof XxlRpcException)?e:new XxlRpcException(e);
-                        }
-
-                        return null;
-                    } else if (CallType.ONEWAY == callType) {
-                        client.asyncSend(address, xxlRpcRequest);
-                        return null;
-                    } else {
-                        throw new XxlRpcException("xxl-rpc callType["+ callType +"] invalid");
+                    // future get
+                    XxlRpcResponse xxlRpcResponse = futureResponse.get(timeout, TimeUnit.MILLISECONDS);
+                    if (xxlRpcResponse.getErrorMsg() != null) {
+                        throw new XxlRpcException(xxlRpcResponse.getErrorMsg());
                     }
+                    return xxlRpcResponse.getResult();
+                } catch (Exception e) {
+                    logger.info(">>>>>>>>>>> xxl-job, invoke error, address:{}, XxlRpcRequest{}", address, xxlRpcRequest);
 
+                    throw (e instanceof XxlRpcException)?e:new XxlRpcException(e);
+                } finally{
+                    // remove-InvokerFuture
+                    XxlRpcFutureResponseFactory.removeInvokerFuture(xxlRpcRequest.getRequestId());
                 }
-            });
+            } else if (CallType.FUTURE == callType) {
+
+                // thread future set
+                XxlRpcInvokeFuture invokeFuture = null;
+                try {
+                    // future set
+                    invokeFuture = new XxlRpcInvokeFuture(new XxlRpcFutureResponse(xxlRpcRequest, null));
+                    XxlRpcInvokeFuture.setFuture(invokeFuture);
+
+                    // do invoke
+                    client.asyncSend(address, xxlRpcRequest);
+
+                    return null;
+                } catch (Exception e) {
+                    logger.info(">>>>>>>>>>> xxl-job, invoke error, address:{}, XxlRpcRequest{}", address, xxlRpcRequest);
+
+                    // remove-InvokerFuture
+                    invokeFuture.stop();
+
+                    throw (e instanceof XxlRpcException)?e:new XxlRpcException(e);
+                }
+
+            } else if (CallType.CALLBACK == callType) {
+
+                // get callback
+                XxlRpcInvokeCallback finalInvokeCallback = invokeCallback;
+                XxlRpcInvokeCallback threadInvokeCallback = XxlRpcInvokeCallback.getCallback();
+                if (threadInvokeCallback != null) {
+                    finalInvokeCallback = threadInvokeCallback;
+                }
+                if (finalInvokeCallback == null) {
+                    throw new XxlRpcException("xxl-rpc XxlRpcInvokeCallback（CallType="+ CallType.CALLBACK.name() +"） cannot be null.");
+                }
+
+                try {
+                    // future set
+                    XxlRpcFutureResponse futureResponse = new XxlRpcFutureResponse(xxlRpcRequest, finalInvokeCallback);
+
+                    client.asyncSend(address, xxlRpcRequest);
+                } catch (Exception e) {
+                    logger.info(">>>>>>>>>>> xxl-job, invoke error, address:{}, XxlRpcRequest{}", address, xxlRpcRequest);
+
+                    // future remove
+                    XxlRpcFutureResponseFactory.removeInvokerFuture(xxlRpcRequest.getRequestId());
+
+                    throw (e instanceof XxlRpcException)?e:new XxlRpcException(e);
+                }
+
+                return null;
+            } else if (CallType.ONEWAY == callType) {
+                client.asyncSend(address, xxlRpcRequest);
+                return null;
+            } else {
+                throw new XxlRpcException("xxl-rpc callType["+ callType +"] invalid");
+            }
+
+        }
+    });
 }
   
  ``` 
@@ -413,6 +416,7 @@ public XxlRpcResponse invokeService(XxlRpcRequest xxlRpcRequest) {
 
     // match service bean
     String serviceKey = makeServiceKey(xxlRpcRequest.getClassName(), xxlRpcRequest.getVersion());
+    //通过缓存类serviceData获取已实例化的对象
     Object serviceBean = serviceData.get(serviceKey);
 
     // valid
@@ -1193,5 +1197,518 @@ public static void removeJobThread(int jobId, String removeOldReason){
 
 
 ```
+
+### 3.2.4 调度中心各种路由策略实现原理
+
+
+- 路由策略：当执行器集群部署时，提供丰富的路由策略，包括
+
+```aidl
+FIRST（第一个）：固定选择第一个机器；
+LAST（最后一个）：固定选择最后一个机器；
+ROUND（轮询）：；
+RANDOM（随机）：随机选择在线的机器；
+CONSISTENT_HASH（一致性HASH）：每个任务按照Hash算法固定选择某一台机器，且所有任务均匀散列在不同机器上。
+LEAST_FREQUENTLY_USED（最不经常使用）：使用频率最低的机器优先被选举；
+LEAST_RECENTLY_USED（最近最久未使用）：最久为使用的机器优先被选举；
+FAILOVER（故障转移）：按照顺序依次进行心跳检测，第一个心跳检测成功的机器选定为目标执行器并发起调度；
+BUSYOVER（忙碌转移）：按照顺序依次进行空闲检测，第一个空闲检测成功的机器选定为目标执行器并发起调度；
+SHARDING_BROADCAST(分片广播)：广播触发对应集群中所有机器执行一次任务，同时系统自动传递分片参数；可根据分片参数开发分片任务；
+
+public enum ExecutorRouteStrategyEnum {
+    FIRST(I18nUtil.getString("jobconf_route_first"), new ExecutorRouteFirst()),
+    LAST(I18nUtil.getString("jobconf_route_last"), new ExecutorRouteLast()),
+    ROUND(I18nUtil.getString("jobconf_route_round"), new ExecutorRouteRound()),
+    RANDOM(I18nUtil.getString("jobconf_route_random"), new ExecutorRouteRandom()),
+    CONSISTENT_HASH(I18nUtil.getString("jobconf_route_consistenthash"), new ExecutorRouteConsistentHash()),
+    LEAST_FREQUENTLY_USED(I18nUtil.getString("jobconf_route_lfu"), new ExecutorRouteLFU()),
+    LEAST_RECENTLY_USED(I18nUtil.getString("jobconf_route_lru"), new ExecutorRouteLRU()),
+    FAILOVER(I18nUtil.getString("jobconf_route_failover"), new ExecutorRouteFailover()),
+    BUSYOVER(I18nUtil.getString("jobconf_route_busyover"), new ExecutorRouteBusyover()),
+    SHARDING_BROADCAST(I18nUtil.getString("jobconf_route_shard"), null);
+}
+
+FIRST（第一个）实现原理是取执行器地址列表的第一个
+    public class ExecutorRouteFirst extends ExecutorRouter {
+        @Override
+        public ReturnT<String> route(TriggerParam triggerParam, List<String> addressList){
+            return new ReturnT<String>(addressList.get(0));
+        }
+    }
+LAST（最后一个）实现原理是取执行器地址列表的最后一个
+    public class ExecutorRouteLast extends ExecutorRouter {
+        @Override
+        public ReturnT<String> route(TriggerParam triggerParam, List<String> addressList) {
+            return new ReturnT<String>(addressList.get(addressList.size()-1));
+        }
+    }
+ROUND（轮询）实现原理是本地调度中心保存任务id的调度次数，下次+1进行轮训选择执行器
+    public class ExecutorRouteRound extends ExecutorRouter {
+    
+        private static ConcurrentHashMap<Integer, Integer> routeCountEachJob = new ConcurrentHashMap<Integer, Integer>();
+        private static long CACHE_VALID_TIME = 0;
+        private static int count(int jobId) {
+            // cache clear
+            if (System.currentTimeMillis() > CACHE_VALID_TIME) {
+                routeCountEachJob.clear();
+                CACHE_VALID_TIME = System.currentTimeMillis() + 1000*60*60*24;
+            }
+            // count++
+            Integer count = routeCountEachJob.get(jobId);
+            count = (count==null || count>1000000)?(new Random().nextInt(100)):++count;  // 初始化时主动Random一次，缓解首次压力
+            routeCountEachJob.put(jobId, count);
+            return count;
+        }
+        @Override
+        public ReturnT<String> route(TriggerParam triggerParam, List<String> addressList) {
+            String address = addressList.get(count(triggerParam.getJobId())%addressList.size());
+            return new ReturnT<String>(address);
+        }
+    }
+RANDOM（随机）：随机选择在线的机器；
+    public class ExecutorRouteRandom extends ExecutorRouter {
+        private static Random localRandom = new Random();
+        @Override
+        public ReturnT<String> route(TriggerParam triggerParam, List<String> addressList) {
+            String address = addressList.get(localRandom.nextInt(addressList.size()));
+            return new ReturnT<String>(address);
+        }
+    }    
+CONSISTENT_HASH（一致性HASH）：每个任务按照Hash算法固定选择某一台机器，且所有任务均匀散列在不同机器上。
+    一致性HASH环，每个地址在环上对应多个位置（虚拟节点解决不均衡问题），任务id 的HASH值落在环上，顺时针找到第一个
+    执行器地址返回。
+    /**
+     * 分组下机器地址相同，不同JOB均匀散列在不同机器上，保证分组下机器分配JOB平均；且每个JOB固定调度其中一台机器；
+     *      a、virtual node：解决不均衡问题
+     *      b、hash method replace hashCode：String的hashCode可能重复，需要进一步扩大hashCode的取值范围
+     * Created by xuxueli on 17/3/10.
+     */
+    public class ExecutorRouteConsistentHash extends ExecutorRouter {
+        private static int VIRTUAL_NODE_NUM = 5;
+        /**
+         * get hash code on 2^32 ring (md5散列的方式计算hash值)
+         * @param key
+         * @return
+         */
+        private static long hash(String key) {
+            // md5 byte
+            MessageDigest md5;
+            try {
+                md5 = MessageDigest.getInstance("MD5");
+            } catch (NoSuchAlgorithmException e) {
+                throw new RuntimeException("MD5 not supported", e);
+            }
+            md5.reset();
+            byte[] keyBytes = null;
+            try {
+                keyBytes = key.getBytes("UTF-8");
+            } catch (UnsupportedEncodingException e) {
+                throw new RuntimeException("Unknown string :" + key, e);
+            }
+            md5.update(keyBytes);
+            byte[] digest = md5.digest();
+            // hash code, Truncate to 32-bits
+            long hashCode = ((long) (digest[3] & 0xFF) << 24)
+                    | ((long) (digest[2] & 0xFF) << 16)
+                    | ((long) (digest[1] & 0xFF) << 8)
+                    | (digest[0] & 0xFF);
+            long truncateHashCode = hashCode & 0xffffffffL;
+            return truncateHashCode;
+        }
+        public String hashJob(int jobId, List<String> addressList) {
+            // ------A1------A2-------A3------
+            // -----------J1------------------
+            TreeMap<Long, String> addressRing = new TreeMap<Long, String>();
+            for (String address: addressList) {
+                for (int i = 0; i < VIRTUAL_NODE_NUM; i++) {
+                    long addressHash = hash("SHARD-" + address + "-NODE-" + i);
+                    addressRing.put(addressHash, address);
+                }
+            }
+            long jobHash = hash(String.valueOf(jobId));
+            SortedMap<Long, String> lastRing = addressRing.tailMap(jobHash);
+            if (!lastRing.isEmpty()) {
+                return lastRing.get(lastRing.firstKey());
+            }
+            return addressRing.firstEntry().getValue();
+        }
+        @Override
+        public ReturnT<String> route(TriggerParam triggerParam, List<String> addressList) {
+            String address = hashJob(triggerParam.getJobId(), addressList);
+            return new ReturnT<String>(address);
+        }
+    }   
+LEAST_FREQUENTLY_USED（最不经常使用）：使用频率最低的机器优先被选举；
+    每个任务ID -> 所有执行器地址和执行次数，每次获取执行次数最少的那个执行器地址返回
+    public class ExecutorRouteLFU extends ExecutorRouter {
+        private static ConcurrentHashMap<Integer, HashMap<String, Integer>> jobLfuMap = new ConcurrentHashMap<Integer, HashMap<String, Integer>>();
+        private static long CACHE_VALID_TIME = 0;
+        public String route(int jobId, List<String> addressList) {
+            // cache clear
+            if (System.currentTimeMillis() > CACHE_VALID_TIME) {
+                jobLfuMap.clear();
+                CACHE_VALID_TIME = System.currentTimeMillis() + 1000*60*60*24;
+            }
+            // lfu item init
+            HashMap<String, Integer> lfuItemMap = jobLfuMap.get(jobId);     // Key排序可以用TreeMap+构造入参Compare；Value排序暂时只能通过ArrayList；
+            if (lfuItemMap == null) {
+                lfuItemMap = new HashMap<String, Integer>();
+                jobLfuMap.putIfAbsent(jobId, lfuItemMap);   // 避免重复覆盖
+            }
+            for (String address: addressList) {
+                if (!lfuItemMap.containsKey(address) || lfuItemMap.get(address) >1000000 ) {
+                    lfuItemMap.put(address, new Random().nextInt(addressList.size()));  // 初始化时主动Random一次，缓解首次压力
+                }
+            }
+            // load least userd count address
+            List<Map.Entry<String, Integer>> lfuItemList = new ArrayList<Map.Entry<String, Integer>>(lfuItemMap.entrySet());
+            Collections.sort(lfuItemList, new Comparator<Map.Entry<String, Integer>>() {
+                @Override
+                public int compare(Map.Entry<String, Integer> o1, Map.Entry<String, Integer> o2) {
+                    return o1.getValue().compareTo(o2.getValue());
+                }
+            });
+            Map.Entry<String, Integer> addressItem = lfuItemList.get(0);
+            String minAddress = addressItem.getKey();
+            addressItem.setValue(addressItem.getValue() + 1);
+            return addressItem.getKey();
+        }
+        @Override
+        public ReturnT<String> route(TriggerParam triggerParam, List<String> addressList) {
+            String address = route(triggerParam.getJobId(), addressList);
+            return new ReturnT<String>(address);
+        }
+    }
+    
+LEAST_RECENTLY_USED（最近最久未使用）：最久未使用的机器优先被选举；
+     LinkedHashMap有顺序的 ，可以实现访问排序，get的key被放到最后，链表最前的key是最久未使用
+    /**
+     * 单个JOB对应的每个执行器，最久为使用的优先被选举
+     *      a、LFU(Least Frequently Used)：最不经常使用，频率/次数
+     *      b(*)、LRU(Least Recently Used)：最近最久未使用，时间
+     */
+    public class ExecutorRouteLRU extends ExecutorRouter {
+        private static ConcurrentHashMap<Integer, LinkedHashMap<String, String>> jobLRUMap = new ConcurrentHashMap<Integer, LinkedHashMap<String, String>>();
+        private static long CACHE_VALID_TIME = 0;
+        public String route(int jobId, List<String> addressList) {
+            // cache clear
+            if (System.currentTimeMillis() > CACHE_VALID_TIME) {
+                jobLRUMap.clear();
+                CACHE_VALID_TIME = System.currentTimeMillis() + 1000*60*60*24;
+            }
+            // init lru
+            LinkedHashMap<String, String> lruItem = jobLRUMap.get(jobId);
+            if (lruItem == null) {
+                /**
+                 * LinkedHashMap
+                 *      a、accessOrder：ture=访问顺序排序（get/put时排序）；false=插入顺序排期；
+                 *      b、removeEldestEntry：新增元素时将会调用，返回true时会删除最老元素；可封装LinkedHashMap并重写该方法，比如定义最大容量，超出是返回true即可实现固定长度的LRU算法；
+                 */
+                lruItem = new LinkedHashMap<String, String>(16, 0.75f, true);
+                jobLRUMap.putIfAbsent(jobId, lruItem);
+            }
+            // put
+            for (String address: addressList) {
+                if (!lruItem.containsKey(address)) {
+                    lruItem.put(address, address);
+                }
+            }
+            // load
+            String eldestKey = lruItem.entrySet().iterator().next().getKey();
+            String eldestValue = lruItem.get(eldestKey);
+            return eldestValue;
+        }
+        @Override
+        public ReturnT<String> route(TriggerParam triggerParam, List<String> addressList) {
+            String address = route(triggerParam.getJobId(), addressList);
+            return new ReturnT<String>(address);
+        }
+    }
+
+FAILOVER（故障转移）：按照顺序依次进行心跳检测，第一个心跳检测成功的机器选定为目标执行器并发起调度；
+    使用ExecutorBiz的RPC方法去执行器发送心跳包，执行器返回成功的话就获取这个机器运行
+    public class ExecutorRouteFailover extends ExecutorRouter {
+        @Override
+        public ReturnT<String> route(TriggerParam triggerParam, List<String> addressList) {
+            StringBuffer beatResultSB = new StringBuffer();
+            for (String address : addressList) {
+                // beat
+                ReturnT<String> beatResult = null;
+                try {
+                    ExecutorBiz executorBiz = XxlJobDynamicScheduler.getExecutorBiz(address);
+                    beatResult = executorBiz.beat();
+                    //      public ReturnT<String> beat() { 执行器实现类中直接返回成功
+                    //          return ReturnT.SUCCESS;
+                    //      }                                     
+                } catch (Exception e) {
+                    logger.error(e.getMessage(), e);
+                    beatResult = new ReturnT<String>(ReturnT.FAIL_CODE, ""+e );
+                }
+                beatResultSB.append( (beatResultSB.length()>0)?"<br><br>":"")
+                        .append(I18nUtil.getString("jobconf_beat") + "：")
+                        .append("<br>address：").append(address)
+                        .append("<br>code：").append(beatResult.getCode())
+                        .append("<br>msg：").append(beatResult.getMsg());
+                // beat success
+                if (beatResult.getCode() == ReturnT.SUCCESS_CODE) {
+                    beatResult.setMsg(beatResultSB.toString());
+                    beatResult.setContent(address);
+                    return beatResult;
+                }
+            }
+            return new ReturnT<String>(ReturnT.FAIL_CODE, beatResultSB.toString());
+        }
+    }
+
+BUSYOVER（忙碌转移）：按照顺序依次进行空闲检测，第一个空闲检测成功的机器选定为目标执行器并发起调度；
+    使用ExecutorBiz的RPC方法给执行器判断执行器上的对应线程是否在运行，没有运行的话就获取这个机器运行
+    public class ExecutorRouteBusyover extends ExecutorRouter {
+        @Override
+        public ReturnT<String> route(TriggerParam triggerParam, List<String> addressList) {
+            StringBuffer idleBeatResultSB = new StringBuffer();
+            for (String address : addressList) {
+                // beat
+                ReturnT<String> idleBeatResult = null;
+                try {
+                    ExecutorBiz executorBiz = XxlJobDynamicScheduler.getExecutorBiz(address);
+                    idleBeatResult = executorBiz.idleBeat(triggerParam.getJobId());
+                        // public ReturnT<String> idleBeat(int jobId) { 执行器中的实现类，判断任务ID对应的线程是否在运行
+                        //      boolean isRunningOrHasQueue = false;
+                        //      JobThread jobThread = XxlJobExecutor.loadJobThread(jobId);
+                       //       if (jobThread != null && jobThread.isRunningOrHasQueue()) {
+                        //         isRunningOrHasQueue = true;
+                       //       }      
+                      //        if (isRunningOrHasQueue) {
+                       //           return new ReturnT<String>(ReturnT.FAIL_CODE, "job thread is running or has trigger queue.");
+                      //        }
+                      //        return ReturnT.SUCCESS;                      
+                } catch (Exception e) {
+                    logger.error(e.getMessage(), e);
+                    idleBeatResult = new ReturnT<String>(ReturnT.FAIL_CODE, ""+e );
+                }
+                idleBeatResultSB.append( (idleBeatResultSB.length()>0)?"<br><br>":"")
+                        .append(I18nUtil.getString("jobconf_idleBeat") + "：")
+                        .append("<br>address：").append(address)
+                        .append("<br>code：").append(idleBeatResult.getCode())
+                        .append("<br>msg：").append(idleBeatResult.getMsg());
+                // beat success
+                if (idleBeatResult.getCode() == ReturnT.SUCCESS_CODE) {
+                    idleBeatResult.setMsg(idleBeatResultSB.toString());
+                    idleBeatResult.setContent(address);
+                    return idleBeatResult;
+                }
+            }
+            return new ReturnT<String>(ReturnT.FAIL_CODE, idleBeatResultSB.toString());
+        }
+    }   
+ SHARDING_BROADCAST(分片广播)：广播触发对应集群中所有机器执行一次任务，同时系统自动传递分片参数；可根据分片参数开发分片任务；    
+    当路由策略为SHARDING_BROADCAST时，给当前任务组的所有执行器地址发送任务进行执行，每个执行器得到分片ID和分片总数两个参数
+     if (ExecutorRouteStrategyEnum.SHARDING_BROADCAST==ExecutorRouteStrategyEnum.match(jobInfo.getExecutorRouteStrategy(), null)
+             && CollectionUtils.isNotEmpty(group.getRegistryList()) && shardingParam==null) {
+         for (int i = 0; i < group.getRegistryList().size(); i++) {
+             processTrigger(group, jobInfo, finalFailRetryCount, triggerType, i, group.getRegistryList().size());//触发任务执行
+         }
+     }
+ 
+```
+
+### 3.2.5 调度中心页面中查看执行日志如何实现Rolling实时日志
+
+- 调度中心页面使用joblog.detail.1.js定时执行请求，获取执行器中最新的日志内容并显示到页面
+
+```aidl
+    $(function() {
+        // trigger fail, end
+        if ( !(triggerCode == 200 || handleCode != 0) ) {
+            $('#logConsoleRunning').hide();
+            $('#logConsole').append('<span style="color: red;">'+ I18n.joblog_rolling_log_triggerfail +'</span>');
+            return;
+        }
+        // pull log
+        var fromLineNum = 1;    // [from, to], start as 1
+        var pullFailCount = 0;
+        function pullLog() {
+            // pullFailCount, max=20
+            if (pullFailCount++ > 20) {
+                logRunStop('<span style="color: red;">'+ I18n.joblog_rolling_log_failoften +'</span>');
+                return;
+            }
+            // load
+            console.log("pullLog, fromLineNum:" + fromLineNum);
+            $.ajax({
+                type : 'POST',
+                async: false,   // sync, make log ordered
+                url : base_url + '/joblog/logDetailCat',
+                data : {
+                    "executorAddress":executorAddress,
+                    "triggerTime":triggerTime,
+                    "logId":logId,
+                    "fromLineNum":fromLineNum  //从多少行开始
+                },
+                dataType : "json",
+                success : function(data){
+                    if (data.code == 200) {
+                        if (!data.content) {
+                            console.log('pullLog fail');
+                            return;
+                        }
+                        if (fromLineNum != data.content.fromLineNum) {
+                            console.log('pullLog fromLineNum not match');
+                            return;
+                        }
+                        if (fromLineNum > data.content.toLineNum ) { //请求日志到结束了
+                            console.log('pullLog already line-end');
+                            // valid end
+                            if (data.content.end) {
+                                //停止当前js的定时器
+                                logRunStop('<br><span style="color: green;">[Rolling Log Finish]</span>');
+                                return;
+                            }
+                            return;
+                        }
+                        // append content
+                        fromLineNum = data.content.toLineNum + 1;
+                        $('#logConsole').append(data.content.logContent);
+                        pullFailCount = 0;
+                        // scroll to bottom
+                        scrollTo(0, document.body.scrollHeight);        // $('#logConsolePre').scrollTop( document.body.scrollHeight + 300 );
+                    } else {
+                        console.log('pullLog fail:'+data.msg);
+                    }
+                }
+            });
+        }
+        // pull first page
+        pullLog();
+        // handler already callback, end
+        if (handleCode > 0) {
+            logRunStop('<br><span style="color: green;">[Load Log Finish]</span>');
+            return;
+        }
+        // round until end
+        var logRun = setInterval(function () { //每3秒钟请求一次日志
+            pullLog()
+        }, 3000);
+        function logRunStop(content){
+            $('#logConsoleRunning').hide();
+            logRun = window.clearInterval(logRun);
+            $('#logConsole').append(content);
+        }
+    });
+```
+
+- 调度中心接口接受页面JS的请求转发给执行器并获取结果
+
+```aidl
+	@RequestMapping("/logDetailCat")
+	@ResponseBody
+	public ReturnT<LogResult> logDetailCat(String executorAddress, long triggerTime, int logId, int fromLineNum){
+		try {
+			ExecutorBiz executorBiz = XxlJobDynamicScheduler.getExecutorBiz(executorAddress);
+			//远程RPC调用
+			ReturnT<LogResult> logResult = executorBiz.log(triggerTime, logId, fromLineNum);
+			// is end
+            if (logResult.getContent()!=null && logResult.getContent().getFromLineNum() > logResult.getContent().getToLineNum()) {
+                XxlJobLog jobLog = xxlJobLogDao.load(logId);
+                //当任务执行完成后，并且读取日志开始行数是日志最后一行了、就可以设置日志读取完成了，js也会停止定时器
+                if (jobLog.getHandleCode() > 0) {
+                    logResult.getContent().setEnd(true);
+                }
+            }
+			return logResult;
+		} catch (Exception e) {
+			logger.error(e.getMessage(), e);
+			return new ReturnT<LogResult>(ReturnT.FAIL_CODE, e.getMessage());
+		}
+	}	
+```
+
+- 执行器获取执行器的方式
+```aidl
+    @Override
+    public ReturnT<LogResult> log(long logDateTim, int logId, int fromLineNum) {
+        // log filename: logPath/yyyy-MM-dd/9999.log
+        //执行器日志文件存储在本地，名称使用makeLogFileName方法名称
+        String logFileName = XxlJobFileAppender.makeLogFileName(new Date(logDateTim), logId);
+        //从fromLineNum开始返回最新的执行日志，
+        LogResult logResult = XxlJobFileAppender.readLog(logFileName, fromLineNum);
+        return new ReturnT<LogResult>(logResult);
+    }	
+```
+
+### 3.2.6 GLUE模式(Java)任务如何实现
+
+- 调度中心页面中写java代码，可以在执行器中运行该java代码
+
+```aidl
+在页面中写下面的代码，保存在调度中心的数据库中
+    package com.xxl.job.service.handler;
+    import com.xxl.job.core.log.XxlJobLogger;
+    import com.xxl.job.core.biz.model.ReturnT;
+    import com.xxl.job.core.handler.IJobHandler;
+    public class DemoGlueJobHandler extends IJobHandler {
+        @Override
+        public ReturnT<String> execute(String param) throws Exception {
+            XxlJobLogger.log("XXL-JOB, Hello World.");
+            return ReturnT.SUCCESS;
+        }
+    }
+
+调度中心执行该任务，任务类型为GLUE模式(Java)，发送执行参数给执行器
+    TriggerParam triggerParam = new TriggerParam();
+    triggerParam.setJobId(jobInfo.getId());
+    triggerParam.setGlueType(jobInfo.getGlueType());
+    triggerParam.setGlueSource(jobInfo.getGlueSource()); //内容为在上面页面的源码
+    runExecutor(triggerParam, address);
+```
+
+- 执行器根据GlueType类型执行Glue的任务
+```aidl
+类型为GLUE模式(Java)的执行逻辑，把triggerParam.getGlueSource()加载成一个jobHandler类进行运行
+ if (GlueTypeEnum.GLUE_GROOVY == glueTypeEnum) {
+            // valid old jobThread
+            if (jobThread != null &&
+                    !(jobThread.getHandler() instanceof GlueJobHandler
+                        && ((GlueJobHandler) jobThread.getHandler()).getGlueUpdatetime()==triggerParam.getGlueUpdatetime() )) {
+                // change handler or gluesource updated, need kill old thread
+                removeOldReason = "change job source or glue type, and terminate the old job thread.";
+                jobThread = null;
+                jobHandler = null;
+            }
+            // valid handler
+            if (jobHandler == null) {
+                try {
+                    IJobHandler originJobHandler = GlueFactory.getInstance().loadNewInstance(triggerParam.getGlueSource());
+                    jobHandler = new GlueJobHandler(originJobHandler, triggerParam.getGlueUpdatetime());
+                } catch (Exception e) {
+                    logger.error(e.getMessage(), e);
+                    return new ReturnT<String>(ReturnT.FAIL_CODE, e.getMessage());
+                }
+            }
+        }
+把triggerParam.getGlueSource()加载成一个jobHandler类
+ 	public IJobHandler loadNewInstance(String codeSource) throws Exception{
+ 		if (codeSource!=null && codeSource.trim().length()>0) {
+ 			Class<?> clazz = groovyClassLoader.parseClass(codeSource);
+ 			if (clazz != null) {
+ 				Object instance = clazz.newInstance();
+ 				if (instance!=null) {
+ 					if (instance instanceof IJobHandler) {
+ 						this.injectService(instance);
+ 						return (IJobHandler) instance;
+ 					} else {
+ 						throw new IllegalArgumentException(">>>>>>>>>>> xxl-glue, loadNewInstance error, "
+ 								+ "cannot convert from instance["+ instance.getClass() +"] to IJobHandler");
+ 					}
+ 				}
+ 			}
+ 		}
+ 		throw new IllegalArgumentException(">>>>>>>>>>> xxl-glue, loadNewInstance error, instance is null");
+ 	}       
+
+```
+
+
+
 
 # 四、其他
