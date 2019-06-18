@@ -25,7 +25,7 @@ Maven3+
 Jdk1.7+
 Mysql5.6+
 
-源码版本： 2.0.1 和 2.0.2
+源码版本： 2.0.1(主) 和 2.1.0
 
 ```
 ## 1.3 源码及官网
@@ -659,12 +659,10 @@ public class RemoteHttpJobBean extends QuartzJobBean {
 }
 
 JobTriggerPoolHelper.trigger后调用下面的代码，线程池执行一个任务
-private ThreadPoolExecutor triggerPool = new ThreadPoolExecutor(
-         32,
-         256,
-         60L,
-         TimeUnit.SECONDS,
-         new LinkedBlockingQueue<Runnable>(1000));
+public static void trigger(int jobId, TriggerTypeEnum triggerType, int failRetryCount, String executorShardingParam, String executorParam) {
+     helper.addTrigger(jobId, triggerType, failRetryCount, executorShardingParam, executorParam);
+}
+
  public void addTrigger(final int jobId, final TriggerTypeEnum triggerType, final int failRetryCount, final String executorShardingParam, final String executorParam) {
      triggerPool.execute(new Runnable() {
          @Override
@@ -673,12 +671,285 @@ private ThreadPoolExecutor triggerPool = new ThreadPoolExecutor(
          }
      });
  }
-最后执行下面代码，访问执行器工程的RPC接口，启动任务
+private ThreadPoolExecutor triggerPool = new ThreadPoolExecutor(32,256, 60L,TimeUnit.SECONDS,
+      new LinkedBlockingQueue<Runnable>(1000));
+XxlJobTrigger.trigger最后执行下面代码，访问执行器工程的RPC接口，启动任务
 ExecutorBiz executorBiz = XxlJobDynamicScheduler.getExecutorBiz(address);
 runResult = executorBiz.run(triggerParam);
 ```
 
 2.0.1版本时自己实现任务调度
+
+- 添加启动定时任务
+
+```aidl
+	@Override
+	public ReturnT<String> start(int id) {
+		XxlJobInfo xxlJobInfo = xxlJobInfoDao.loadById(id);
+
+		// next trigger time (10s后生效，避开预读周期)
+		long nextTriggerTime = 0;
+		try {
+			nextTriggerTime = new CronExpression(xxlJobInfo.getJobCron()).getNextValidTimeAfter(new Date(System.currentTimeMillis() + 10000)).getTime();
+		} catch (ParseException e) {
+			logger.error(e.getMessage(), e);
+			return new ReturnT<String>(ReturnT.FAIL_CODE, I18nUtil.getString("jobinfo_field_cron_unvalid")+" | "+ e.getMessage());
+		}
+
+		xxlJobInfo.setTriggerStatus(1);
+		xxlJobInfo.setTriggerLastTime(0);
+		xxlJobInfo.setTriggerNextTime(nextTriggerTime); //给任务设置下次开始运行的时间
+		xxlJobInfoDao.update(xxlJobInfo);
+		return ReturnT.SUCCESS;
+	}
+
+启动两个线程进行定时任务触发	
+public class JobScheduleHelper {
+    private static Logger logger = LoggerFactory.getLogger(JobScheduleHelper.class);
+
+    private static JobScheduleHelper instance = new JobScheduleHelper();
+    public static JobScheduleHelper getInstance(){
+        return instance;
+    }
+
+    private Thread scheduleThread;
+    private Thread ringThread;
+    private volatile boolean toStop = false;
+    private volatile static Map<Integer, List<Integer>> ringData = new ConcurrentHashMap<>();
+
+    public void start(){
+
+        // schedule thread
+        scheduleThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+
+                try {
+                    TimeUnit.MILLISECONDS.sleep(5000 - System.currentTimeMillis()%1000 );
+                } catch (InterruptedException e) {
+                    if (!toStop) {
+                        logger.error(e.getMessage(), e);
+                    }
+                }
+                logger.info(">>>>>>>>> init xxl-job admin scheduler success.");
+
+                while (!toStop) {
+
+                    // 扫描任务
+                    long start = System.currentTimeMillis();
+                    Connection conn = null;
+                    PreparedStatement preparedStatement = null;
+                    try {
+                        if (conn==null || conn.isClosed()) {
+                            conn = XxlJobAdminConfig.getAdminConfig().getDataSource().getConnection();
+                        }
+                        conn.setAutoCommit(false);
+                        //使用数据库中的锁，多个进程时，只有一个进程能触发获取定时任务
+                        preparedStatement = conn.prepareStatement(  "select * from xxl_job_lock where lock_name = 'schedule_lock' for update" );
+                        preparedStatement.execute();
+
+                        // tx start
+
+                        // 1、预读10s内调度任务
+                        long maxNextTime = System.currentTimeMillis() + 10000;
+                        long nowTime = System.currentTimeMillis();
+                        //获取最近10秒，要运行的任务
+                        List<XxlJobInfo> scheduleList = XxlJobAdminConfig.getAdminConfig().getXxlJobInfoDao().scheduleJobQuery(maxNextTime);
+                        if (scheduleList!=null && scheduleList.size()>0) {
+                            // 2、推送时间轮
+                            for (XxlJobInfo jobInfo: scheduleList) {
+
+                                // 时间轮刻度计算
+                                int ringSecond = -1;
+                                if (jobInfo.getTriggerNextTime() < nowTime - 10000) {   // 过期超10s：本地忽略，当前时间开始计算下次触发时间
+                                    ringSecond = -1;
+
+                                    jobInfo.setTriggerLastTime(jobInfo.getTriggerNextTime());
+                                    jobInfo.setTriggerNextTime(
+                                            new CronExpression(jobInfo.getJobCron())
+                                                    .getNextValidTimeAfter(new Date())
+                                                    .getTime()
+                                    );
+                                } else if (jobInfo.getTriggerNextTime() < nowTime) {    // 过期10s内：立即触发一次，当前时间开始计算下次触发时间
+                                    ringSecond = (int)((nowTime/1000)%60);
+
+                                    jobInfo.setTriggerLastTime(jobInfo.getTriggerNextTime());
+                                    jobInfo.setTriggerNextTime(
+                                            new CronExpression(jobInfo.getJobCron())
+                                                    .getNextValidTimeAfter(new Date())
+                                                    .getTime()
+                                    );
+                                } else {    // 未过期：正常触发，递增计算下次触发时间
+                                    ringSecond = (int)((jobInfo.getTriggerNextTime()/1000)%60);
+
+                                    jobInfo.setTriggerLastTime(jobInfo.getTriggerNextTime());
+                                    jobInfo.setTriggerNextTime(
+                                            new CronExpression(jobInfo.getJobCron())
+                                                    .getNextValidTimeAfter(new Date(jobInfo.getTriggerNextTime()))
+                                                    .getTime()
+                                    );
+                                }
+                                if (ringSecond == -1) {
+                                    continue;
+                                }
+
+                                // push async ring
+                                List<Integer> ringItemData = ringData.get(ringSecond);
+                                if (ringItemData == null) {
+                                    ringItemData = new ArrayList<Integer>();
+                                    ringData.put(ringSecond, ringItemData);
+                                }
+                                ringItemData.add(jobInfo.getId());
+
+                                logger.debug(">>>>>>>>>>> xxl-job, push time-ring : " + ringSecond + " = " + Arrays.asList(ringItemData) );
+                            }
+
+                            // 3、更新trigger信息
+                            for (XxlJobInfo jobInfo: scheduleList) {
+                                XxlJobAdminConfig.getAdminConfig().getXxlJobInfoDao().scheduleUpdate(jobInfo);
+                            }
+
+                        }
+
+                        // tx stop
+
+                        conn.commit();
+                    } catch (Exception e) {
+                        if (!toStop) {
+                            logger.error(">>>>>>>>>>> xxl-job, JobScheduleHelper#scheduleThread error:{}", e);
+                        }
+                    } finally {
+                        if (conn != null) {
+                            try {
+                                conn.close();
+                            } catch (SQLException e) {
+                            }
+                        }
+                        if (null != preparedStatement) {
+                            try {
+                                preparedStatement.close();
+                            } catch (SQLException ignore) {
+                            }
+                        }
+                    }
+                    long cost = System.currentTimeMillis()-start;
+
+                    // next second, align second
+                    try {
+                        if (cost < 1000) {
+                            TimeUnit.MILLISECONDS.sleep(1000 - System.currentTimeMillis()%1000);
+                        }
+                    } catch (InterruptedException e) {
+                        if (!toStop) {
+                            logger.error(e.getMessage(), e);
+                        }
+                    }
+
+                }
+                logger.info(">>>>>>>>>>> xxl-job, JobScheduleHelper#scheduleThread stop");
+            }
+        });
+        scheduleThread.setDaemon(true);
+        scheduleThread.setName("xxl-job, admin JobScheduleHelper#scheduleThread");
+        scheduleThread.start();
+
+
+        // ring thread
+        //这线程实现的方式 我看的一点也不好 实时性也不行 可以使用ScheduledThreadPoolExecutor方式
+        ringThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+
+                // align second
+                try {
+                    TimeUnit.MILLISECONDS.sleep(1000 - System.currentTimeMillis()%1000 );
+                } catch (InterruptedException e) {
+                    if (!toStop) {
+                        logger.error(e.getMessage(), e);
+                    }
+                }
+
+                int lastSecond = -1;
+                while (!toStop) {
+
+                    try {
+                        // second data
+                        List<Integer> ringItemData = new ArrayList<>();
+                        int nowSecond = (int)((System.currentTimeMillis()/1000)%60);   // 避免处理耗时太长，跨过刻度；
+                        if (lastSecond == -1) {
+                            lastSecond = (nowSecond+59)%60;
+                        }
+                        for (int i = 1; i <=60; i++) {
+                            int secondItem = (lastSecond+i)%60;
+
+                            List<Integer> tmpData = ringData.remove(secondItem);
+                            if (tmpData != null) {
+                                ringItemData.addAll(tmpData);
+                            }
+
+                            if (secondItem == nowSecond) {
+                                break;
+                            }
+                        }
+                        lastSecond = nowSecond;
+
+                        // ring trigger
+                        logger.debug(">>>>>>>>>>> xxl-job, time-ring beat : " + nowSecond + " = " + Arrays.asList(ringItemData) );
+                        if (ringItemData!=null && ringItemData.size()>0) {
+                            // do trigger
+                            for (int jobId: ringItemData) {
+                                // do trigger
+                                JobTriggerPoolHelper.trigger(jobId, TriggerTypeEnum.CRON, -1, null, null);
+                            }
+                            // clear
+                            ringItemData.clear();
+                        }
+                    } catch (Exception e) {
+                        if (!toStop) {
+                            logger.error(">>>>>>>>>>> xxl-job, JobScheduleHelper#ringThread error:{}", e);
+                        }
+                    }
+
+                    // next second, align second
+                    try {
+                        TimeUnit.MILLISECONDS.sleep(1000 - System.currentTimeMillis()%1000);
+                    } catch (InterruptedException e) {
+                        if (!toStop) {
+                            logger.error(e.getMessage(), e);
+                        }
+                    }
+                }
+                logger.info(">>>>>>>>>>> xxl-job, JobScheduleHelper#ringThread stop");
+            }
+        });
+        ringThread.setDaemon(true);
+        ringThread.setName("xxl-job, admin JobScheduleHelper#ringThread");
+        ringThread.start();
+    }
+
+    public void toStop(){
+        toStop = true;
+
+        // interrupt and wait
+        scheduleThread.interrupt();
+        try {
+            scheduleThread.join();
+        } catch (InterruptedException e) {
+            logger.error(e.getMessage(), e);
+        }
+
+        // interrupt and wait
+        ringThread.interrupt();
+        try {
+            ringThread.join();
+        } catch (InterruptedException e) {
+            logger.error(e.getMessage(), e);
+        }
+    }
+
+}	
+```
+
 
 - 
 
@@ -1707,7 +1978,74 @@ BUSYOVER（忙碌转移）：按照顺序依次进行空闲检测，第一个空
  	}       
 
 ```
+- GlueType类型为脚本类（shell、Python、php、Nodejs、powershell）的执行逻辑
 
+```aidl
+
+GlueType类型
+    public enum GlueTypeEnum {
+        BEAN("BEAN", false, null, null),
+        GLUE_GROOVY("GLUE(Java)", false, null, null),
+        GLUE_SHELL("GLUE(Shell)", true, "bash", ".sh"),
+        GLUE_PYTHON("GLUE(Python)", true, "python", ".py"),
+        GLUE_PHP("GLUE(PHP)", true, "php", ".php"),
+        GLUE_NODEJS("GLUE(Nodejs)", true, "node", ".js"),
+        GLUE_POWERSHELL("GLUE(PowerShell)", true, "powershell ", ".ps1");
+    }
+    if (glueTypeEnum!=null && glueTypeEnum.isScript()) {
+                // valid old jobThread
+                if (jobThread != null &&
+                        !(jobThread.getHandler() instanceof ScriptJobHandler
+                                && ((ScriptJobHandler) jobThread.getHandler()).getGlueUpdatetime()==triggerParam.getGlueUpdatetime() )) {
+                    // change script or gluesource updated, need kill old thread
+                    removeOldReason = "change job source or glue type, and terminate the old job thread.";
+                    jobThread = null;
+                    jobHandler = null;
+                }
+                // valid handler
+                if (jobHandler == null) {
+                    jobHandler = new ScriptJobHandler(triggerParam.getJobId(), triggerParam.getGlueUpdatetime(), triggerParam.getGlueSource(), GlueTypeEnum.match(triggerParam.getGlueType()));
+                }
+     }     
+ ScriptJobHandler中执行方法最后调用execToFile执行脚本
+    //cmd为bash或python或php或node或powershell
+    //scriptFile为脚本执行内容
+    public static int execToFile(String command, String scriptFile, String logFile, String... params) throws IOException {
+            // 标准输出：print （null if watchdog timeout）
+            // 错误输出：logging + 异常 （still exists if watchdog timeout）
+            // 标准输入  
+            FileOutputStream fileOutputStream = null;   //
+            try {
+                fileOutputStream = new FileOutputStream(logFile, true);
+                PumpStreamHandler streamHandler = new PumpStreamHandler(fileOutputStream, fileOutputStream, null); 
+                // command
+                CommandLine commandline = new CommandLine(command); //使用的是org.apache.commons.exe包
+                commandline.addArgument(scriptFile);
+                if (params!=null && params.length>0) {
+                    commandline.addArguments(params);
+                }   
+                // exec
+                DefaultExecutor exec = new DefaultExecutor();
+                exec.setExitValues(null);
+                exec.setStreamHandler(streamHandler);
+                int exitValue = exec.execute(commandline);  // exit code: 0=success, 1=error
+                return exitValue;
+            } catch (Exception e) {
+                XxlJobLogger.log(e);
+                return -1;
+            } finally {
+                if (fileOutputStream != null) {
+                    try {
+                        fileOutputStream.close();
+                    } catch (IOException e) {
+                        XxlJobLogger.log(e);
+                    }
+    
+                }
+            }
+        }
+    
+```
 
 
 
