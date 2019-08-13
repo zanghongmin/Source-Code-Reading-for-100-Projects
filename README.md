@@ -7,7 +7,23 @@
 - [XXL-REGISTRY](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/XXL-REGISTRY.md)  
 > XXL-REGISTRY 是一个轻量级分布式服务注册中心，拥有"轻量级、秒级注册上线、多环境、跨语言、跨机房"等特性。现已开放源代码，开箱即用。
 - [JAVA-CODE-GENERATOR](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/JAVA-CODE-GENERATOR.md)  
->  JAVA-CODE-GENERATOR是一个 "controller/service/dao/mybatis/model" 多层的代码生成平台。只需要提供SQL，将会自动生成全部代码。
+> JAVA-CODE-GENERATOR是一个 "controller/service/dao/mybatis/model" 多层的代码生成平台。只需要提供SQL，将会自动生成全部代码。
+- [spring-boot-seckill](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/spring-boot-seckill.md)  
+> spring-boot-seckill是分布式秒杀的测试案例，单纯为了学习，某些案例并不适用于生产环境，大家根据所需自行调整。
+- [spring-boot-websocket-chat-demo](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/spring-boot-websocket-chat-demo.md)  
+> spring-boot-websocket-chat-demo是websocket实现的聊天室案例，实时推送信息到客户端。
+- [spring-boot-pay](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/spring-boot-pay.md)  
+> spring-boot-pay是支付服务：支付宝，微信，银联详细代码案例。
+
+
+
+https://github.com/diyhi/bbs
+https://github.com/wuyouzhuguli/SpringAll
+https://github.com/b3log/solo
+https://github.com/jmdhappy/xxpay-master
+https://gitee.com/52itstyle/spring-boot-elasticsearch
+
+
 
 
 
