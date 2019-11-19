@@ -14,6 +14,17 @@
 > spring-boot-websocket-chat-demo是websocket实现的聊天室案例，实时推送信息到客户端。
 - [spring-boot-pay](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/spring-boot-pay.md)  
 > spring-boot-pay是支付服务：支付宝，微信，银联详细代码案例。
+- [xxpay-master](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/xxpay-master.md)  
+> XxPay聚合支付使用Java开发，包括spring-cloud、dubbo、spring-boot三个架构版本，已接入微信、支付宝等主流支付渠道，可直接用于生产环境。
+- [Dubbo](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/dubbo.md)  
+    > Apache Dubbo™ 是一款高性能Java RPC框架
+    - [Dubbo-Registry](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/dubbo-Registry.md)  
+        > 注册中心，多种实现方式，推荐使用zookeeper       
+    - [Dubbo-Extension-SPI](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/dubbo-extension.md)  
+        > dubbo拓展使用spi及其自适应拓展，要对dubbo源码有更深的了解，需要详细的分析下这块
+    - [Dubbo-Monitor](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/dubbo-Monitor.md)  
+        > 监控中心      
+
 
 
 
@@ -22,6 +33,7 @@ https://github.com/wuyouzhuguli/SpringAll
 https://github.com/b3log/solo
 https://github.com/jmdhappy/xxpay-master
 https://gitee.com/52itstyle/spring-boot-elasticsearch
+https://github.com/EhsanTang/ApiManager
 
 
 
