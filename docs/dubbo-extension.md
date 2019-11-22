@@ -6,10 +6,8 @@
 * [三、项目设计](#三项目设计)
     * [3.1 总体设计](#31-总体设计)
     * [3.2 关键点分析](#32-关键点分析)
-        * [3.2.1 基本的XxlRegistryBaseClient与服务端各种交互实现原理](#321-基本的XxlRegistryBaseClient与服务端各种交互实现原理)  
-        * [3.2.2 增强客户端的XxlRegistryClient实现原理](#322-增强客户端的XxlRegistryClient实现原理)
-        * [3.2.3 长轮询方式long-polling实现原理](#323-长轮询方式long-polling实现原理)
-
+        * [3.2.1 总体设计-dubbo SPI接口层分析](#321-总体设计-dubbo SPI接口层分析)  
+        * [3.2.2 dubbo扩展源码介绍](#322-dubbo扩展源码介绍)
 * [四、其他](#四其他)
 
 # 一、项目概览
@@ -26,11 +24,67 @@
 # 二、项目使用
 
 ```aidl
-代码中类似这样的语句使用dubbo拓展
-private static final Protocol protocol = ExtensionLoader.getExtensionLoader(Protocol.class).getAdaptiveExtension();
 
 先看下 http://dubbo.apache.org/zh-cn/docs/source_code_guide/dubbo-spi.html 
 
+代码中类似这样的语句使用dubbo拓展
+    private static final Protocol protocol = ExtensionLoader.getExtensionLoader(Protocol.class).getAdaptiveExtension();
+
+配置
+<!-- 用dubbo协议在20880端口暴露服务 -->
+    <dubbo:protocol name="dubbo" port="20880" />
+    
+dubbo XML配置定义，继承spring的接口
+    public class DubboNamespaceHandler extends NamespaceHandlerSupport {
+        static {
+            Version.checkDuplicate(DubboNamespaceHandler.class);
+        }
+        @Override
+        public void init() {
+            registerBeanDefinitionParser("application", new DubboBeanDefinitionParser(ApplicationConfig.class, true));
+            registerBeanDefinitionParser("module", new DubboBeanDefinitionParser(ModuleConfig.class, true));
+            registerBeanDefinitionParser("registry", new DubboBeanDefinitionParser(RegistryConfig.class, true));
+            registerBeanDefinitionParser("monitor", new DubboBeanDefinitionParser(MonitorConfig.class, true));
+            registerBeanDefinitionParser("provider", new DubboBeanDefinitionParser(ProviderConfig.class, true));
+            registerBeanDefinitionParser("consumer", new DubboBeanDefinitionParser(ConsumerConfig.class, true));
+            //Protocol的配置类
+            registerBeanDefinitionParser("protocol", new DubboBeanDefinitionParser(ProtocolConfig.class, true));
+            registerBeanDefinitionParser("service", new DubboBeanDefinitionParser(ServiceBean.class, true));
+            registerBeanDefinitionParser("reference", new DubboBeanDefinitionParser(ReferenceBean.class, false));
+            registerBeanDefinitionParser("annotation", new AnnotationBeanDefinitionParser());
+        }
+    }
+
+在ServiceBean中加载当前protocol的配置类
+    if ((getProtocols() == null || getProtocols().isEmpty())
+            && (getProvider() == null || getProvider().getProtocols() == null || getProvider().getProtocols().isEmpty())) {
+        //从Spring中获取ProtocolConfig.class的所有实例
+        Map<String, ProtocolConfig> protocolConfigMap = applicationContext == null ? null : BeanFactoryUtils.beansOfTypeIncludingAncestors(applicationContext, ProtocolConfig.class, false, false);
+        if (protocolConfigMap != null && protocolConfigMap.size() > 0) {
+            List<ProtocolConfig> protocolConfigs = new ArrayList<ProtocolConfig>();
+            for (ProtocolConfig config : protocolConfigMap.values()) {
+                if (config.isDefault() == null || config.isDefault().booleanValue()) {
+                    protocolConfigs.add(config);
+                }
+            }
+            if (protocolConfigs != null && !protocolConfigs.isEmpty()) {
+                //设置当前protocol的配置类
+                super.setProtocols(protocolConfigs);
+            }
+        }
+    }
+当执行如export(Invoker<T> invoker)方法，从Invoker获取URl。URL中有protocol的配置，
+ExtensionLoader.getExtensionLoader(Protocol.class).getAdaptiveExtension();  根据当前URL中protocol的配置，执行不同protocol实现类的方法
+    @SPI("dubbo")
+    public interface Protocol {
+        int getDefaultPort();
+        @Adaptive
+        <T> Exporter<T> export(Invoker<T> invoker) throws RpcException;
+        @Adaptive
+        <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException;
+        void destroy();
+    }
+    
 ```
 
 # 三、项目设计
@@ -553,16 +607,29 @@ getExtensionLoader(Protocol.class)过程
                 return instance;
             }
             objectFactory.getExtension过程              
-                //AdaptiveExtensionFactory中的实现，先走SpiExtensionFactory，再SpringExtensionFactory 查找
-                public <T> T getExtension(Class<T> type, String name) {
-                    for (ExtensionFactory factory : factories) {     
-                        //获取扩展类，获取到了就直接返回
-                        T extension = factory.getExtension(type, name);
-                        if (extension != null) {
-                            return extension;
+                //AdaptiveExtensionFactory中的实现，先走SpiExtensionFactory，再SpringExtensionFactory 查找            
+                @Adaptive
+                public class AdaptiveExtensionFactory implements ExtensionFactory {      
+                    //factories 包含SpiExtensionFactory和SpringExtensionFactory的实例         
+                    private final List<ExtensionFactory> factories;              
+                    public AdaptiveExtensionFactory() {
+                        ExtensionLoader<ExtensionFactory> loader = ExtensionLoader.getExtensionLoader(ExtensionFactory.class);
+                        List<ExtensionFactory> list = new ArrayList<ExtensionFactory>();
+                        for (String name : loader.getSupportedExtensions()) {
+                            list.add(loader.getExtension(name));
                         }
-                    }
-                    return null;
+                        factories = Collections.unmodifiableList(list);
+                    }              
+                    @Override
+                    public <T> T getExtension(Class<T> type, String name) {
+                        for (ExtensionFactory factory : factories) {
+                            T extension = factory.getExtension(type, name);
+                            if (extension != null) {
+                                return extension;
+                            }
+                        }
+                        return null;
+                    }               
                 }
                 public class SpiExtensionFactory implements ExtensionFactory {           
                     @Override
@@ -637,7 +704,7 @@ getExtensionLoader(Protocol.class)过程
     }
 getAdaptiveExtension()过程
     public T getAdaptiveExtension() {
-        //缓存中获取，一个SPI类只有一个自适应注解
+        //缓存中获取，一个SPI类只有一个自适应扩展实例
         Object instance = cachedAdaptiveInstance.get();
         if (instance == null) {
             if (createAdaptiveInstanceError == null) {
@@ -645,7 +712,7 @@ getAdaptiveExtension()过程
                     instance = cachedAdaptiveInstance.get();
                     if (instance == null) {
                         try {
-                            //创建自适应注解
+                            //创建自适应扩展实例
                             instance = createAdaptiveExtension();
                             cachedAdaptiveInstance.set(instance);
                         } catch (Throwable t) {
@@ -660,7 +727,258 @@ getAdaptiveExtension()过程
         }  
         return (T) instance;
     }    
-
+    private T createAdaptiveExtension() {
+        try {
+            //获取自适应扩展class类并实例化，再注入，返回自适应扩展实例
+            return injectExtension((T) getAdaptiveExtensionClass().newInstance());
+        } catch (Exception e) {
+            throw new IllegalStateException("Can not create adaptive extension " + type + ", cause: " + e.getMessage(), e);
+        }
+    }
+    private Class<?> getAdaptiveExtensionClass() {
+        //加载SPI所有的实现类class并缓存到本地变量
+        getExtensionClasses();
+        //SPI实现类中，如果有在类上加@Adaptive注解的那么该类就是自适应扩展class类，直接返回即可，目前平台只有两个SPI接口Compiler和ExtensionFactory是在类有@Adaptive注解
+        if (cachedAdaptiveClass != null) {
+            return cachedAdaptiveClass;
+        }
+        //其他的情况走这个逻辑，重新生成代码并编译成类
+        return cachedAdaptiveClass = createAdaptiveExtensionClass();
+    }   
+    //重新生成代码并编译成类,以Protocol接口为例
+    private Class<?> createAdaptiveExtensionClass() {
+        //接口代码
+        //        package com.alibaba.dubbo.rpc;                    
+        //        import com.alibaba.dubbo.common.URL;
+        //        import com.alibaba.dubbo.common.extension.Adaptive;
+        //        import com.alibaba.dubbo.common.extension.SPI;
+        //        @SPI("dubbo")
+        //        public interface Protocol {
+        //            int getDefaultPort();
+        //            @Adaptive
+        //            <T> Exporter<T> export(Invoker<T> invoker) throws RpcException;
+        //            @Adaptive
+        //            <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException;
+        //            void destroy();
+        //        }
+        //生成的代码code为       
+        //package com.alibaba.dubbo.rpc;
+        //import com.alibaba.dubbo.common.URL;
+        //import com.alibaba.dubbo.common.extension.ExtensionLoader;
+        //public class Protocol$Adaptive implements com.alibaba.dubbo.rpc.Protocol {
+        //    private URL url;
+        //    public void destroy() {
+        //             throw new UnsupportedOperationException("method public abstract void com.alibaba.dubbo.rpc.Protocol.destroy() of interface com.alibaba.dubbo.rpc.Protocol is not adaptive method!");
+        //    }
+        //    public int getDefaultPort() {
+        //            throw new UnsupportedOperationException("method public abstract int com.alibaba.dubbo.rpc.Protocol.getDefaultPort() of interface com.alibaba.dubbo.rpc.Protocol is not adaptive method!");
+        //    }
+        //    public com.alibaba.dubbo.rpc.Invoker refer(java.lang.Class arg0, com.alibaba.dubbo.common.URL arg1) throws com.alibaba.dubbo.rpc.RpcException {
+        //        if (arg1 == null) throw new IllegalArgumentException("url == null");
+        //        com.alibaba.dubbo.common.URL url = arg1;
+        //        String extName = ( url.getProtocol() == null ? "dubbo" : url.getProtocol() );
+        //        if(extName == null) throw new IllegalStateException("Fail to get extension(com.alibaba.dubbo.rpc.Protocol) name from url(" + url.toString() + ") use keys([protocol])");
+        //        com.alibaba.dubbo.rpc.Protocol extension = (com.alibaba.dubbo.rpc.Protocol)ExtensionLoader.getExtensionLoader(com.alibaba.dubbo.rpc.Protocol.class).getExtension(extName);
+        //        return extension.refer(arg0, arg1);
+        //    }
+        //    public com.alibaba.dubbo.rpc.Exporter export(com.alibaba.dubbo.rpc.Invoker arg0) throws com.alibaba.dubbo.rpc.RpcException {
+        //        if (arg0 == null) throw new IllegalArgumentException("com.alibaba.dubbo.rpc.Invoker argument == null");
+        //        if (arg0.getUrl() == null) throw new IllegalArgumentException("com.alibaba.dubbo.rpc.Invoker argument getUrl() == null");com.alibaba.dubbo.common.URL url = arg0.getUrl();
+        //        String extName = ( url.getProtocol() == null ? "dubbo" : url.getProtocol() );
+        //        if(extName == null) throw new IllegalStateException("Fail to get extension(com.alibaba.dubbo.rpc.Protocol) name from url(" + url.toString() + ") use keys([protocol])");
+        //        com.alibaba.dubbo.rpc.Protocol extension = (com.alibaba.dubbo.rpc.Protocol)ExtensionLoader.getExtensionLoader(com.alibaba.dubbo.rpc.Protocol.class).getExtension(extName);
+        //        return extension.export(arg0);
+        //    }
+        //}
+        //生成的代码的方法根据参数找到URL，再根据URL的相应参数，通过getExtension获取真正的SPI实现类，进行方法调用
+        String code = createAdaptiveExtensionClassCode();
+        ClassLoader classLoader = findClassLoader();
+        com.alibaba.dubbo.common.compiler.Compiler compiler = ExtensionLoader.getExtensionLoader(com.alibaba.dubbo.common.compiler.Compiler.class).getAdaptiveExtension();
+        //把生成的代码动态编译为class
+        return compiler.compile(code, classLoader);
+    }
+       
+dubbo动态编译compile介绍
+    //SPI接口默认使用javassist编译
+    @SPI("javassist")
+    public interface Compiler {
+      Class<?> compile(String code, ClassLoader classLoader);     
+    }  
+    //抽象类
+    public abstract class AbstractCompiler implements Compiler {
+        private static final Pattern PACKAGE_PATTERN = Pattern.compile("package\\s+([$_a-zA-Z][$_a-zA-Z0-9\\.]*);");
+        private static final Pattern CLASS_PATTERN = Pattern.compile("class\\s+([$_a-zA-Z][$_a-zA-Z0-9]*)\\s+");
+        @Override
+        public Class<?> compile(String code, ClassLoader classLoader) {
+            code = code.trim();
+            Matcher matcher = PACKAGE_PATTERN.matcher(code);
+            //获取包名
+            String pkg;
+            if (matcher.find()) {
+                pkg = matcher.group(1);
+            } else {
+                pkg = "";
+            }
+            matcher = CLASS_PATTERN.matcher(code);
+            //获取类名
+            String cls;
+            if (matcher.find()) {
+                cls = matcher.group(1);
+            } else {
+                throw new IllegalArgumentException("No such class name in " + code);
+            }
+            //class名
+            String className = pkg != null && pkg.length() > 0 ? pkg + "." + cls : cls;
+            try {
+                //直接根据获取class名,返回当前JVM已加载的Class，保障只有一个class加载，失败的话走catch
+                return Class.forName(className, true, ClassHelper.getCallerClassLoader(getClass()));
+            } catch (ClassNotFoundException e) {
+                if (!code.endsWith("}")) {
+                    throw new IllegalStateException("The java code not endsWith \"}\", code: \n" + code + "\n");
+                }
+                try {
+                    //当前JVM中没有加载该className时，重写加载该className，具体实现由子类
+                    return doCompile(className, code);
+                } catch (RuntimeException t) {
+                    throw t;
+                } catch (Throwable t) {
+                    throw new IllegalStateException("Failed to compile class, cause: " + t.getMessage() + ", class: " + className + ", code: \n" + code + "\n, stack: " + ClassUtils.toString(t));
+                }
+            }
+        }
+        protected abstract Class<?> doCompile(String name, String source) throws Throwable;
+    }    
+    //  自适应类
+    //  配置方式：<dubbo:application name="validation-provider" compiler="jdk"/>  ,默认为javassist
+    //  在ApplicationConfig类调用下方法指定当前使用哪个编译类（javassist和jdk）
+    //     public void setCompiler(String compiler) {
+    //         this.compiler = compiler;
+    //         AdaptiveCompiler.setDefaultCompiler(compiler);
+    //     }
+    @Adaptive
+    public class AdaptiveCompiler implements Compiler {    
+        private static volatile String DEFAULT_COMPILER;  
+        public static void setDefaultCompiler(String compiler) {
+            DEFAULT_COMPILER = compiler;
+        }    
+        @Override
+        public Class<?> compile(String code, ClassLoader classLoader) {
+            Compiler compiler;
+            ExtensionLoader<Compiler> loader = ExtensionLoader.getExtensionLoader(Compiler.class);
+            String name = DEFAULT_COMPILER; // copy reference
+            if (name != null && name.length() > 0) {
+                //根据配置加载编译类
+                compiler = loader.getExtension(name);
+            } else {
+                //默认为javassist
+                compiler = loader.getDefaultExtension();
+            }
+            return compiler.compile(code, classLoader);
+        }   
+    }    
+    //javassist实现类
+    public class JavassistCompiler extends AbstractCompiler {
+        private static final Pattern IMPORT_PATTERN = Pattern.compile("import\\s+([\\w\\.\\*]+);\n");
+        private static final Pattern EXTENDS_PATTERN = Pattern.compile("\\s+extends\\s+([\\w\\.]+)[^\\{]*\\{\n");
+        private static final Pattern IMPLEMENTS_PATTERN = Pattern.compile("\\s+implements\\s+([\\w\\.]+)\\s*\\{\n");
+        private static final Pattern METHODS_PATTERN = Pattern.compile("\n(private|public|protected)\\s+");
+        private static final Pattern FIELD_PATTERN = Pattern.compile("[^\n]+=[^\n]+;");
+        @Override
+        public Class<?> doCompile(String name, String source) throws Throwable {
+            int i = name.lastIndexOf('.');
+            String className = i < 0 ? name : name.substring(i + 1);
+            ClassPool pool = new ClassPool(true);
+            pool.appendClassPath(new LoaderClassPath(ClassHelper.getCallerClassLoader(getClass())));
+            Matcher matcher = IMPORT_PATTERN.matcher(source);
+            List<String> importPackages = new ArrayList<String>();
+            Map<String, String> fullNames = new HashMap<String, String>();
+            while (matcher.find()) {
+                String pkg = matcher.group(1);
+                if (pkg.endsWith(".*")) {
+                    String pkgName = pkg.substring(0, pkg.length() - 2);
+                    pool.importPackage(pkgName);
+                    importPackages.add(pkgName);
+                } else {
+                    int pi = pkg.lastIndexOf('.');
+                    if (pi > 0) {
+                        String pkgName = pkg.substring(0, pi);
+                        pool.importPackage(pkgName);
+                        importPackages.add(pkgName);
+                        fullNames.put(pkg.substring(pi + 1), pkg);
+                    }
+                }
+            }
+            String[] packages = importPackages.toArray(new String[0]);
+            matcher = EXTENDS_PATTERN.matcher(source);
+            CtClass cls;
+            if (matcher.find()) {
+                String extend = matcher.group(1).trim();
+                String extendClass;
+                if (extend.contains(".")) {
+                    extendClass = extend;
+                } else if (fullNames.containsKey(extend)) {
+                    extendClass = fullNames.get(extend);
+                } else {
+                    extendClass = ClassUtils.forName(packages, extend).getName();
+                }
+                cls = pool.makeClass(name, pool.get(extendClass));
+            } else {
+                cls = pool.makeClass(name);
+            }
+            matcher = IMPLEMENTS_PATTERN.matcher(source);
+            if (matcher.find()) {
+                String[] ifaces = matcher.group(1).trim().split("\\,");
+                for (String iface : ifaces) {
+                    iface = iface.trim();
+                    String ifaceClass;
+                    if (iface.contains(".")) {
+                        ifaceClass = iface;
+                    } else if (fullNames.containsKey(iface)) {
+                        ifaceClass = fullNames.get(iface);
+                    } else {
+                        ifaceClass = ClassUtils.forName(packages, iface).getName();
+                    }
+                    cls.addInterface(pool.get(ifaceClass));
+                }
+            }
+            String body = source.substring(source.indexOf("{") + 1, source.length() - 1);
+            String[] methods = METHODS_PATTERN.split(body);
+            for (String method : methods) {
+                method = method.trim();
+                if (method.length() > 0) {
+                    if (method.startsWith(className)) {
+                        cls.addConstructor(CtNewConstructor.make("public " + method, cls));
+                    } else if (FIELD_PATTERN.matcher(method).matches()) {
+                        cls.addField(CtField.make("private " + method, cls));
+                    } else {
+                        cls.addMethod(CtNewMethod.make("public " + method, cls));
+                    }
+                }
+            }
+            return cls.toClass(ClassHelper.getCallerClassLoader(getClass()), JavassistCompiler.class.getProtectionDomain());
+        }
+    }    
+    //jdk实现类
+    public class JdkCompiler extends AbstractCompiler {    
+        private final JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+        ...
+            @Override
+            public Class<?> doCompile(String name, String sourceCode) throws Throwable {
+                int i = name.lastIndexOf('.');
+                String packageName = i < 0 ? "" : name.substring(0, i);
+                String className = i < 0 ? name : name.substring(i + 1);
+                JavaFileObjectImpl javaFileObject = new JavaFileObjectImpl(className, sourceCode);
+                javaFileManager.putFileForInput(StandardLocation.SOURCE_PATH, packageName,
+                        className + ClassUtils.JAVA_EXTENSION, javaFileObject);
+                Boolean result = compiler.getTask(null, javaFileManager, diagnosticCollector, options,
+                        null, Arrays.asList(javaFileObject)).call();
+                if (result == null || !result) {
+                    throw new IllegalStateException("Compilation failed. class: " + name + ", diagnostics: " + diagnosticCollector);
+                }
+                return classLoader.loadClass(name);
+            }
+         ...
+    }
 
 ```
 
@@ -672,3 +990,60 @@ getAdaptiveExtension()过程
 
 
 # 四、其他
+
+
+
+
+
+- java正则记录知识点
+```aidl
+
+在 Java 中，\\ 表示：我要插入一个正则表达式的反斜线，所以其后的字符具有特殊的意义。   
+所以，在其他的语言中（如Perl），一个反斜杠 \ 就足以具有转义的作用，而在 Java 中正则表达式中则需要有两个反斜杠才能被解析为其他语言中的转义作用。
+也可以简单的理解在 Java 的正则表达式中，两个 \\ 代表其他语言中的一个 \，这也就是为什么表示一位数字的正则表达式是 \\d，
+而表示一个普通的反斜杠是 \\\\。
+     public static void main(String[] args) {
+                String regex = "([1-9]\\d*)([+\\-*/])([1-9]\\d*=?)";
+                Pattern pattern = Pattern.compile(regex);
+                Matcher matcher = pattern.matcher("a11+2dasfdsadfe5+6eesdfxca");
+                System.out.println(matcher.groupCount());
+                while (matcher.find()){
+                    for (int i = 0; i <= matcher.groupCount(); i++) {
+                        System.out.println("The index of the final one character is " + matcher.start(i));
+                        System.out.println("The index of the last one character is " + matcher.end(i));
+                        System.out.println("The content of the corresponding substring of this string is " + matcher.group(i));
+                    }
+                }
+        }
+      结果：
+      3        //matcher.groupCount()为3一共有3组，分别是([1-9]\\d*)   和  ([+\\-*/]) 和 ([1-9]\\d*=?)，及每个括号内算一个
+      //执行matcher.find()一次，就可以看匹配的第一个内容，11+2 为第一次匹配regex的格式
+      The index of the final one character is 1  //matcher.start(0)  匹配字符串的全部内容的第一个字符开始的下标
+      The index of the last one character is 5  //matcher.start(0)  匹配字符串的全部内容的最后一个字符开始的下标
+      The content of the corresponding substring of this string is 11+2    //matcher.group(0)  匹配字符串的全部内容
+      The index of the final one character is 1  //matcher.start(1)  匹配字符串的第一个组的第一个字符开始的下标
+      The index of the last one character is 3  //matcher.start(1)  匹配字符串的第一个组的最后一个字符开始的下标
+      The content of the corresponding substring of this string is 11  //matcher.group(1)  匹配字符串的第一个组([1-9]\\d*)的内容
+      The index of the final one character is 3
+      The index of the last one character is 4
+      The content of the corresponding substring of this string is + //matcher.group(2)  匹配字符串的第二个组([+\\-*/])的内容
+      The index of the final one character is 4
+      The index of the last one character is 5
+      The content of the corresponding substring of this string is 2 //matcher.group(3)  匹配字符串的第三个组([1-9]\\d*=?)的内容
+      //执行matcher.find()又一次，就可以看匹配的第二个内容，5+6 为第二次匹配regex的格式
+      The index of the final one character is 15
+      The index of the last one character is 18
+      The content of the corresponding substring of this string is 5+6 //matcher.group(0)  匹配字符串的全部内容
+      The index of the final one character is 15
+      The index of the last one character is 16
+      The content of the corresponding substring of this string is 5  //matcher.group(1)  匹配字符串的第一个组([1-9]\\d*)的内容
+      The index of the final one character is 16
+      The index of the last one character is 17
+      The content of the corresponding substring of this string is +  //matcher.group(2)  匹配字符串的第二个组([+\\-*/])的内容
+      The index of the final one character is 17
+      The index of the last one character is 18
+      The content of the corresponding substring of this string is 6 //matcher.group(3)  匹配字符串的第三个组([1-9]\\d*=?)的内容
+
+
+
+```
