@@ -6,21 +6,19 @@
 * [三、项目设计](#三项目设计)
     * [3.1 总体设计](#31-总体设计)
     * [3.2 关键点分析](#32-关键点分析)
-        * [3.2.1 基本的XxlRegistryBaseClient与服务端各种交互实现原理](#321-基本的XxlRegistryBaseClient与服务端各种交互实现原理)  
-        * [3.2.2 增强客户端的XxlRegistryClient实现原理](#322-增强客户端的XxlRegistryClient实现原理)
-        * [3.2.3 长轮询方式long-polling实现原理](#323-长轮询方式long-polling实现原理)
+        * [3.2.1 dubbo xml配置实现原理](#321-dubbo xml配置实现原理)  
 
 * [四、其他](#四其他)
 
 # 一、项目概览
 
 ## 1.1 简介
-    dubbo拓展使用spi及其自适应拓展，要对dubbo源码有更深的了解，需要详细的分析下这块
+    dubbo XML配置，与spring xml集成，具体实现原理 
 ## 1.2 环境
     Dubbo2.6.7
 ## 1.3 源码及官网
 
-[官网](http://dubbo.apache.org/zh-cn/docs/source_code_guide/dubbo-spi.html)
+
 [源码](https://github.com/apache/dubbo)
 
 # 二、项目使用
@@ -200,7 +198,7 @@ spring执行代码
 3. META-INF/dubbo.xsd中配置dubbo自定义元素（如application,protocol）的定义 
 
 //spring 先加载NamespaceHandlerSupport的init()方法进行初始化
-//spring 在执行根据命名空间找到对应的命名空间处理器DubboNamespaceHandler时
+//spring 在执行根据命名空间找到对应的命名空间处理器DubboNamespaceHandler
 //NamespaceHandler handler = this.readerContext.getNamespaceHandlerResolver().resolve(namespaceUri);
 //进行NamespaceHandlerSupport的init()方法初始化 ，只初始化一次，有缓存
     public class DubboNamespaceHandler extends NamespaceHandlerSupport {
@@ -223,6 +221,7 @@ spring执行代码
     }
     
 //dubbo元素解析类，集成spring的BeanDefinitionParser，以application为例
+/如 <dubbo:application name="validation-provider"/>
 public class DubboBeanDefinitionParser implements BeanDefinitionParser {
     private static final Logger logger = LoggerFactory.getLogger(DubboBeanDefinitionParser.class);
     private static final Pattern GROUP_AND_VERION = Pattern.compile("^[\\-.0-9_a-zA-Z]+(\\:[\\-.0-9_a-zA-Z]+)?$");
@@ -299,17 +298,29 @@ public class DubboBeanDefinitionParser implements BeanDefinitionParser {
         }
         Set<String> props = new HashSet<String>();
         ManagedMap parameters = null;
+        
+        // beanClass.getMethods() 为：
+        //  0 = {Method@1522} "public java.lang.String com.alibaba.dubbo.config.ApplicationConfig.getName()"
+        //  1 = {Method@1523} "public java.lang.Boolean com.alibaba.dubbo.config.ApplicationConfig.isDefault()"
+        //  2 = {Method@1524} "public void com.alibaba.dubbo.config.ApplicationConfig.setName(java.lang.String)"
+        //  3 = {Method@1525} "public java.util.Map com.alibaba.dubbo.config.ApplicationConfig.getParameters()"
+        //  4 = {Method@1526} "public void com.alibaba.dubbo.config.ApplicationConfig.setDefault(java.lang.Boolean)"
+        //  5 = {Method@1527} "public java.lang.String com.alibaba.dubbo.config.ApplicationConfig.getOwner()"
+        //  ...
         for (Method setter : beanClass.getMethods()) {
             String name = setter.getName();
+            //如 setName() 方法可走下面的逻辑 type为String
             if (name.length() > 3 && name.startsWith("set")
                     && Modifier.isPublic(setter.getModifiers())
                     && setter.getParameterTypes().length == 1) {
                 Class<?> type = setter.getParameterTypes()[0];
+                //  propertyName 为 name
                 String propertyName = name.substring(3, 4).toLowerCase() + name.substring(4);
                 String property = StringUtils.camelToSplitName(propertyName, "-");
                 props.add(property);
                 Method getter = null;
                 try {
+                    // getName() 方法存在
                     getter = beanClass.getMethod("get" + name.substring(3), new Class<?>[0]);
                 } catch (NoSuchMethodException e) {
                     try {
@@ -329,6 +340,7 @@ public class DubboBeanDefinitionParser implements BeanDefinitionParser {
                 } else if ("arguments".equals(property)) {
                     parseArguments(id, element.getChildNodes(), beanDefinition, parserContext);
                 } else {
+                    // value值为validation-provider
                     String value = element.getAttribute(property);
                     if (value != null) {
                         value = value.trim();
@@ -345,6 +357,7 @@ public class DubboBeanDefinitionParser implements BeanDefinitionParser {
                                 parseMultiRef("protocols", value, beanDefinition, parserContext);
                             } else {
                                 Object reference;
+                                //String为基本类型
                                 if (isPrimitive(type)) {
                                     if ("async".equals(property) && "false".equals(value)
                                             || "timeout".equals(property) && "0".equals(value)
@@ -394,6 +407,7 @@ public class DubboBeanDefinitionParser implements BeanDefinitionParser {
                                     }
                                     reference = new RuntimeBeanReference(value);
                                 }
+                                //beanDefinition增加属性 name 为validation-provider
                                 beanDefinition.getPropertyValues().addPropertyValue(propertyName, reference);
                             }
                         }

@@ -422,8 +422,12 @@ FailbackRegistry继承AbstractRegistry
      
      
      //监控通知( 调用父类AbstractRegistry的notify方法)
-     doNotify(url, listener, urls);//调用父类的方法，进行本地监控通知，如注册中心，提供方数据有变化时，本地消费方根据提供方URL，重新生成远程调用地址
-    
+     /调用父类的方法，进行本地监控通知，如注册中心，提供方数据有变化时，本地消费方根据提供方URL，重新生成远程调用地址
+     protected void doNotify(URL url, NotifyListener listener, List<URL> urls) {
+             super.notify(url, listener, urls);
+     }
+
+  
      // ==== Template method ====    具体实现在子类 zookeeper,redis,multicast实现等
      protected abstract void doRegister(URL url);
      protected abstract void doUnregister(URL url);
@@ -515,9 +519,11 @@ RegistryFactory注册中心工厂，用来生成RegistryFactory
     private static final Map<String, Registry> REGISTRIES = new ConcurrentHashMap<String, Registry>();
     @Override
     public Registry getRegistry(URL url) {
+        //zookeeper://10.130.0.237:2181/com.alibaba.dubbo.registry.RegistryService?application=validation-provider&compiler=jdk&dubbo=2.0.2&interface=com.alibaba.dubbo.registry.RegistryService&pid=198260&timestamp=1574667468400
         url = url.setPath(RegistryService.class.getName())
                 .addParameter(Constants.INTERFACE_KEY, RegistryService.class.getName())
                 .removeParameters(Constants.EXPORT_KEY, Constants.REFER_KEY);
+        //key为zookeeper://10.130.0.237:2181/com.alibaba.dubbo.registry.RegistryService
         String key = url.toServiceStringWithoutResolving();
         // Lock the registry access process to ensure a single instance of the registry
         LOCK.lock();
@@ -539,6 +545,23 @@ RegistryFactory注册中心工厂，用来生成RegistryFactory
     }
     // 具体实现在子类 zookeeper,redis,multicast实现等
     protected abstract Registry createRegistry(URL url);
+    
+    //RegistryFactory在RegistryProtocol中通过SPI自动注入方式实例化（自适应类）
+    public class RegistryProtocol implements Protocol {  
+            ...
+            private RegistryFactory registryFactory;
+            ...
+            //registryFactory = {RegistryFactory$Adaptive@2829} 
+            public void setRegistryFactory(RegistryFactory registryFactory) {
+                this.registryFactory = registryFactory;
+            }
+            //注册
+            public void register(URL registryUrl, URL registedProviderUrl) {
+                Registry registry = registryFactory.getRegistry(registryUrl);
+                registry.register(registedProviderUrl);
+            }
+    
+    }
 
 ```
 
@@ -566,13 +589,598 @@ Zookeeper 是 Apacahe Hadoop 的子项目，是一个树型的目录服务，支
 
 ```
 
-extension
+- ZookeeperRegistryFactory
+
+```aidl
+
+//SPI接口com.alibaba.dubbo.registry.RegistryFactory
+//zookeeper=com.alibaba.dubbo.registry.zookeeper.ZookeeperRegistryFactory
+//当Registry registry = registryFactory.getRegistry(registryUrl);（自适应类），根据URL的协议加载zookeeper或别的实现
+public class ZookeeperRegistryFactory extends AbstractRegistryFactory {
+    private ZookeeperTransporter zookeeperTransporter;
+    //自适应类SPI自动注入
+    //zookeeperTransporter = {ZookeeperTransporter$Adaptive@3476} 
+    public void setZookeeperTransporter(ZookeeperTransporter zookeeperTransporter) {
+        this.zookeeperTransporter = zookeeperTransporter;
+    }
+    //直接new对象，在AbstractRegistryFactory中有缓存，只会运行一次这个
+    @Override
+    public Registry createRegistry(URL url) {
+        return new ZookeeperRegistry(url, zookeeperTransporter);
+    }
+}
+
+```
+- ZookeeperRegistry
+
+```aidl
+    //默认端口
+    private final static int DEFAULT_ZOOKEEPER_PORT = 2181;
+    private final static String DEFAULT_ROOT = "dubbo";
+    //在Zookeeper上存储数据的路径，默认是/dubbo
+    private final String root;
+    private final Set<String> anyServices = new ConcurrentHashSet<String>();
+    private final ConcurrentMap<URL, ConcurrentMap<NotifyListener, ChildListener>> zkListeners = new ConcurrentHashMap<URL, ConcurrentMap<NotifyListener, ChildListener>>();
+    //链接Zookeeper的客户端
+    private final ZookeeperClient zkClient;
+    //ZookeeperTransporter为SPI接口，zookeeperTransporter为自适应类，根据URL的参数获取具体实现，默认实现为curator
+    //ZookeeperTransporter为com.alibaba.dubbo.remoting的内容，具体看dubbo-remoting的介绍
+    public ZookeeperRegistry(URL url, ZookeeperTransporter zookeeperTransporter) {
+        //调用父类，主要有启动retryExecutor线程池（每5秒运行一次重试注册失败等）
+        super(url);
+        if (url.isAnyHost()) {
+            throw new IllegalStateException("registry address == null");
+        }
+        String group = url.getParameter(Constants.GROUP_KEY, DEFAULT_ROOT);
+        if (!group.startsWith(Constants.PATH_SEPARATOR)) {
+            group = Constants.PATH_SEPARATOR + group;
+        }
+        //在Zookeeper上存储数据的路径，默认是/dubbo
+        this.root = group;
+        //初始化链接
+        zkClient = zookeeperTransporter.connect(url);
+        //增加监听
+        zkClient.addStateListener(new StateListener() {
+            @Override
+            public void stateChanged(int state) {
+                //和zookeeprt重连时进行recover()。（重新进行服务注册和服务订阅）
+                if (state == RECONNECTED) {
+                    try {
+                        recover();
+                    } catch (Exception e) {
+                        logger.error(e.getMessage(), e);
+                    }
+                }
+            }
+        });
+    }
+    @Override
+    protected void recover() throws Exception {
+        // register 把当前已注册的服务设置为失败状态，failedRegistered（retryExecutor线程池（每5秒运行一次重试注册失败等））
+        Set<URL> recoverRegistered = new HashSet<URL>(getRegistered());
+        if (!recoverRegistered.isEmpty()) {
+            if (logger.isInfoEnabled()) {
+                logger.info("Recover register url " + recoverRegistered);
+            }
+            for (URL url : recoverRegistered) {
+                failedRegistered.add(url);
+            }
+        }
+        // subscribe 把当前已订阅的服务设置为失败状态，addFailedSubscribed（retryExecutor线程池（每5秒运行一次重试订阅失败等））
+        Map<URL, Set<NotifyListener>> recoverSubscribed = new HashMap<URL, Set<NotifyListener>>(getSubscribed());
+        if (!recoverSubscribed.isEmpty()) {
+            if (logger.isInfoEnabled()) {
+                logger.info("Recover subscribe url " + recoverSubscribed.keySet());
+            }
+            for (Map.Entry<URL, Set<NotifyListener>> entry : recoverSubscribed.entrySet()) {
+                URL url = entry.getKey();
+                for (NotifyListener listener : entry.getValue()) {
+                    addFailedSubscribed(url, listener);
+                }
+            }
+        }
+    }
+    
+    // 注册实现
+    @Override
+    protected void doRegister(URL url) {
+        try {
+            //目录， 是否为持久节点
+            zkClient.create(toUrlPath(url), url.getParameter(Constants.DYNAMIC_KEY, true));
+        } catch (Throwable e) {
+            throw new RpcException("Failed to register " + url + " to zookeeper " + getUrl() + ", cause: " + e.getMessage(), e);
+        }
+    }
+    //目录， 是否为临时节点，这个是curator中的实现
+    @Override
+    public void create(String path, boolean ephemeral) {
+        if (!ephemeral) {
+            if (checkExists(path)) {
+                return;
+            }
+        }
+        int i = path.lastIndexOf('/');
+        if (i > 0) {
+            create(path.substring(0, i), false);
+        }
+        if (ephemeral) {
+            createEphemeral(path);
+        } else {
+            createPersistent(path);
+        }
+    }
+    
+    //去掉注册实现
+    @Override
+    protected void doUnregister(URL url) {
+        try {
+            //删除对应的目录
+            zkClient.delete(toUrlPath(url));
+        } catch (Throwable e) {
+            throw new RpcException("Failed to unregister " + url + " to zookeeper " + getUrl() + ", cause: " + e.getMessage(), e);
+        }
+    }
+
+    //订阅实现 
+    // 消费者端例子
+    //url : consumer://10.6.1.250/com.alibaba.dubbo.examples.validation.api.ValidationService?application=validation-consumer&category=providers,configurators,routers&dubbo=2.0.2&interface=com.alibaba.dubbo.examples.validation.api.ValidationService&methods=save,update,delete&pid=217112&side=consumer&timestamp=1574731839267&validation=true
+    //listener = {RegistryDirectory@2938} 
+    @Override
+    protected void doSubscribe(final URL url, final NotifyListener listener) {
+        try {
+            //这个url中interface=*时走这个
+            //dubbo admin走这个逻辑
+            if (Constants.ANY_VALUE.equals(url.getServiceInterface())) {
+                String root = toRootPath();
+                ConcurrentMap<NotifyListener, ChildListener> listeners = zkListeners.get(url);
+                if (listeners == null) {
+                    zkListeners.putIfAbsent(url, new ConcurrentHashMap<NotifyListener, ChildListener>());
+                    listeners = zkListeners.get(url);
+                }
+                ChildListener zkListener = listeners.get(listener);
+                if (zkListener == null) {
+                    listeners.putIfAbsent(listener, new ChildListener() {
+                        @Override
+                        public void childChanged(String parentPath, List<String> currentChilds) {
+                            for (String child : currentChilds) {
+                                child = URL.decode(child);
+                                if (!anyServices.contains(child)) {
+                                    anyServices.add(child);
+                                     // /dubbo目录下有服务变化时的监听类，订阅新增加服务类
+                                    subscribe(url.setPath(child).addParameters(Constants.INTERFACE_KEY, child,
+                                            Constants.CHECK_KEY, String.valueOf(false)), listener);
+                                }
+                            }
+                        }
+                    });
+                    zkListener = listeners.get(listener);
+                }
+                zkClient.create(root, false);
+                List<String> services = zkClient.addChildListener(root, zkListener);
+                if (services != null && !services.isEmpty()) {
+                    for (String service : services) {
+                        service = URL.decode(service);
+                        anyServices.add(service);
+                        subscribe(url.setPath(service).addParameters(Constants.INTERFACE_KEY, service,
+                                Constants.CHECK_KEY, String.valueOf(false)), listener);
+                    }
+                }
+            } else {
+                //服务订阅时走这个逻辑
+                List<URL> urls = new ArrayList<URL>();
+                //path 为/dubbo/com.alibaba.dubbo.examples.validation.api.ValidationService/providers
+                //path 为 /dubbo/com.alibaba.dubbo.examples.validation.api.ValidationService/configurators
+                //path 为 /dubbo/com.alibaba.dubbo.examples.validation.api.ValidationService/routers
+                //消费端会订阅这3个目录
+                for (String path : toCategoriesPath(url)) {
+                    ConcurrentMap<NotifyListener, ChildListener> listeners = zkListeners.get(url);
+                    if (listeners == null) {
+                        zkListeners.putIfAbsent(url, new ConcurrentHashMap<NotifyListener, ChildListener>());
+                        listeners = zkListeners.get(url);
+                    }
+                    ChildListener zkListener = listeners.get(listener);
+                    if (zkListener == null) {
+                        listeners.putIfAbsent(listener, new ChildListener() {
+                            @Override
+                            public void childChanged(String parentPath, List<String> currentChilds) {
+                                //当监听路径的子目录有变化时，调用该方法
+                                //调用的是FailbackRegistry中的notify方法，进行本地服务方法重新注册或调阅
+                                ZookeeperRegistry.this.notify(url, listener, toUrlsWithEmpty(url, parentPath, currentChilds));
+                            }
+                        });
+                        zkListener = listeners.get(listener);
+                    }
+                    zkClient.create(path, false);
+                    //给path路径添加监听
+                    //返回的值为dubbo%3A%2F%2F10.6.1.250%3A20880%2Fcom.alibaba.dubbo.examples.validation.api.ValidationService%3Faccesslog%3Dtrue%26anyhost%3Dtrue%26application%3Dvalidation-provider%26bean.name%3Dcom.alibaba.dubbo.examples.validation.api.ValidationService%26compiler%3Djdk%26dubbo%3D2.0.2%26generic%3Dfalse%26interface%3Dcom.alibaba.dubbo.examples.validation.api.ValidationService%26methods%3Dsave%2Cupdate%2Cdelete%26pid%3D198160%26side%3Dprovider%26timestamp%3D1574668172852
+                    //返回的是当前目录下，所有的URL形式的目录字符串
+                    List<String> children = zkClient.addChildListener(path, zkListener);
+                    if (children != null) {
+                        urls.addAll(toUrlsWithEmpty(url, path, children));
+                    }
+                    //urls为,children为0时URL协议为empty
+                    //0 = {URL@3137} "dubbo://10.6.1.250:20880/com.alibaba.dubbo.examples.validation.api.ValidationService?accesslog=true&anyhost=true&application=validation-provider&bean.name=com.alibaba.dubbo.examples.validation.api.ValidationService&compiler=jdk&dubbo=2.0.2&generic=false&interface=com.alibaba.dubbo.examples.validation.api.ValidationService&methods=save,update,delete&pid=198160&side=provider&timestamp=1574668172852"
+                    //1 = {URL@3138} "empty://10.6.1.250/com.alibaba.dubbo.examples.validation.api.ValidationService?application=validation-consumer&category=configurators&dubbo=2.0.2&interface=com.alibaba.dubbo.examples.validation.api.ValidationService&methods=save,update,delete&pid=223972&side=consumer&timestamp=1574732691830&validation=true"
+                    //2 = {URL@3322} "empty://10.6.1.250/com.alibaba.dubbo.examples.validation.api.ValidationService?application=validation-consumer&category=routers&dubbo=2.0.2&interface=com.alibaba.dubbo.examples.validation.api.ValidationService&methods=save,update,delete&pid=223972&side=consumer&timestamp=1574732691830&validation=true"
+                }
+                //根据返回的urls，第一次调用的是FailbackRegistry中的notify方法，进行本地服务方法重新注册或调阅
+                notify(url, listener, urls);
+            }
+        } catch (Throwable e) {
+            throw new RpcException("Failed to subscribe " + url + " to zookeeper " + getUrl() + ", cause: " + e.getMessage(), e);
+        }
+    }
+
+    //去掉订阅实现 
+    @Override
+    protected void doUnsubscribe(URL url, NotifyListener listener) {
+        ConcurrentMap<NotifyListener, ChildListener> listeners = zkListeners.get(url);
+        if (listeners != null) {
+            ChildListener zkListener = listeners.get(listener);
+            if (zkListener != null) {
+                if (Constants.ANY_VALUE.equals(url.getServiceInterface())) {
+                    String root = toRootPath();
+                    zkClient.removeChildListener(root, zkListener);
+                } else {
+                    for (String path : toCategoriesPath(url)) {
+                        zkClient.removeChildListener(path, zkListener);
+                    }
+                }
+            }
+        }
+    }
+    //查找实现
+    @Override
+    public List<URL> lookup(URL url) {
+        if (url == null) {
+            throw new IllegalArgumentException("lookup url == null");
+        }
+        try {
+            List<String> providers = new ArrayList<String>();
+            for (String path : toCategoriesPath(url)) {
+                List<String> children = zkClient.getChildren(path);
+                if (children != null) {
+                    providers.addAll(children);
+                }
+            }
+            return toUrlsWithoutEmpty(url, providers);
+        } catch (Throwable e) {
+            throw new RpcException("Failed to lookup " + url + " from zookeeper " + getUrl() + ", cause: " + e.getMessage(), e);
+        }
+    }
+    private List<URL> toUrlsWithoutEmpty(URL consumer, List<String> providers) {
+        List<URL> urls = new ArrayList<URL>();
+        if (providers != null && !providers.isEmpty()) {
+            for (String provider : providers) {
+                provider = URL.decode(provider);
+                if (provider.contains("://")) {
+                    URL url = URL.valueOf(provider);
+                    if (UrlUtils.isMatch(consumer, url)) {
+                        urls.add(url);
+                    }
+                }
+            }
+        }
+        return urls;
+    }
+    
+    private List<URL> toUrlsWithEmpty(URL consumer, String path, List<String> providers) {
+        List<URL> urls = toUrlsWithoutEmpty(consumer, providers);
+        if (urls == null || urls.isEmpty()) {
+            int i = path.lastIndexOf('/');
+            String category = i < 0 ? path : path.substring(i + 1);
+            URL empty = consumer.setProtocol(Constants.EMPTY_PROTOCOL).addParameter(Constants.CATEGORY_KEY, category);
+            urls.add(empty);
+        }
+        return urls;
+    }
+```
+
+
 
 
 ## 3.3 dubbo注册中心-multicast实现分析
 
+ - multicast介绍
+ 
+ ![duddo中服务消费方使用注册中心](pic/dubbo-Registry-multicast.png)
+
+```aidl
+Multicast 注册中心不需要启动任何中心节点，只要广播地址一样，就可以互相发现。
+    提供方启动时广播自己的地址
+    消费方启动时广播订阅请求
+    提供方收到订阅请求时，单播自己的地址给订阅者，如果设置了 unicast=false，则广播给订阅者
+    消费方收到提供方地址时，连接该地址进行 RPC 调用。
+组播受网络结构限制，只适合小规模应用或开发阶段使用。组播地址段: 224.0.0.0 - 239.255.255.255
+
+配置
+<dubbo:registry address="multicast://224.5.6.7:1234" />
+或
+<dubbo:registry protocol="multicast" address="224.5.6.7:1234" />
+为了减少广播量，Dubbo 缺省使用单播发送提供者地址信息给消费者，如果一个机器上同时启了多个消费者进程，消费者需声明 unicast=false，
+否则只会有一个消费者能收到消息;当服务者和消费者运行在同一台机器上，消费者同样需要声明unicast=false，
+否则消费者无法收到消息，导致No provider available for the service异常：
+<dubbo:registry address="multicast://224.5.6.7:1234?unicast=false" />
+或
+<dubbo:registry protocol="multicast" address="224.5.6.7:1234">
+    <dubbo:parameter key="unicast" value="false" />
+</dubbo:registry>
+```
+
+- MulticastRegistry
+
+```aidl
+配置 <dubbo:registry address="multicast://224.5.6.7:1234"/>
+
+//SPI接口com.alibaba.dubbo.registry.RegistryFactory
+//multicast=com.alibaba.dubbo.registry.multicast.MulticastRegistryFactory
+//当Registry registry = registryFactory.getRegistry(registryUrl);（自适应类），根据URL的协议加载multicast或别的实现
+public class MulticastRegistryFactory extends AbstractRegistryFactory {
+    //直接new对象，在AbstractRegistryFactory中有缓存，只会运行一次这个
+    @Override
+    public Registry createRegistry(URL url) {
+        return new MulticastRegistry(url);
+    }
+}
+
+//以消费端向注册中心订阅，列出服务提供方的信息
+public class MulticastRegistry extends FailbackRegistry {
+    private static final Logger logger = LoggerFactory.getLogger(MulticastRegistry.class);
+    //组播协议默认端口
+    private static final int DEFAULT_MULTICAST_PORT = 1234;
+    private final InetAddress multicastAddress;
+    private final MulticastSocket multicastSocket;
+    private final int multicastPort;
+    //
+    private final ConcurrentMap<URL, Set<URL>> received = new ConcurrentHashMap<URL, Set<URL>>();
+    private final ScheduledExecutorService cleanExecutor = Executors.newScheduledThreadPool(1, new NamedThreadFactory("DubboMulticastRegistryCleanTimer", true));
+    private final ScheduledFuture<?> cleanFuture;
+    private final int cleanPeriod;
+    private volatile boolean admin = false;
+    public MulticastRegistry(URL url) {
+        super(url);
+        if (url.isAnyHost()) {
+            throw new IllegalStateException("registry address == null");
+        }
+        try {
+            multicastAddress = InetAddress.getByName(url.getHost());
+            checkMulticastAddress(multicastAddress);
+            multicastPort = url.getPort() <= 0 ? DEFAULT_MULTICAST_PORT : url.getPort();
+            //初始化组播
+            multicastSocket = new MulticastSocket(multicastPort);
+            //加入224.5.6.7:1234组，消费端和提供端在一个组中，可相互接受到信息
+            NetUtils.joinMulticastGroup(multicastSocket, multicastAddress);
+            Thread thread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    byte[] buf = new byte[2048];
+                    DatagramPacket recv = new DatagramPacket(buf, buf.length);
+                    while (!multicastSocket.isClosed()) {
+                        try {
+                            //接受消息，消费端和提供端发送组播信息后，加入该组播地址的消费端和提供端都会收到该信息
+                            multicastSocket.receive(recv);
+                            String msg = new String(recv.getData()).trim();
+                            int i = msg.indexOf('\n');
+                            if (i > 0) {
+                                msg = msg.substring(0, i).trim();
+                            }
+                            //信息给该方法进行处理
+                            MulticastRegistry.this.receive(msg, (InetSocketAddress) recv.getSocketAddress());
+                            Arrays.fill(buf, (byte) 0);
+                        } catch (Throwable e) {
+                            if (!multicastSocket.isClosed()) {
+                                logger.error(e.getMessage(), e);
+                            }
+                        }
+                    }
+                }
+            }, "DubboMulticastRegistryReceiver");
+            thread.setDaemon(true);
+            thread.start();
+        } catch (IOException e) {
+            throw new IllegalStateException(e.getMessage(), e);
+        }
+        this.cleanPeriod = url.getParameter(Constants.SESSION_TIMEOUT_KEY, Constants.DEFAULT_SESSION_TIMEOUT);
+        if (url.getParameter("clean", true)) {
+            this.cleanFuture = cleanExecutor.scheduleWithFixedDelay(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        clean(); // Remove the expired
+                    } catch (Throwable t) { // Defensive fault tolerance
+                        logger.error("Unexpected exception occur at clean expired provider, cause: " + t.getMessage(), t);
+                    }
+                }
+            }, cleanPeriod, cleanPeriod, TimeUnit.MILLISECONDS);
+        } else {
+            this.cleanFuture = null;
+        }
+    }
+    private void checkMulticastAddress(InetAddress multicastAddress) {
+        if (!multicastAddress.isMulticastAddress()) {
+            String message = "Invalid multicast address " + multicastAddress;
+            if (!(multicastAddress instanceof Inet4Address)) {
+                throw new IllegalArgumentException(message + ", " +
+                        "ipv4 multicast address scope: 224.0.0.0 - 239.255.255.255.");
+            } else {
+                throw new IllegalArgumentException(message + ", " + "ipv6 multicast address must start with ff, " +
+                        "for example: ff01::1");
+            }
+        }
+    }
+    private static boolean isMulticastAddress(String ip) {
+        int i = ip.indexOf('.');
+        if (i > 0) {
+            String prefix = ip.substring(0, i);
+            if (StringUtils.isInteger(prefix)) {
+                int p = Integer.parseInt(prefix);
+                return p >= 224 && p <= 239;
+            }
+        }
+        return false;
+    }
+    private void clean() {
+        if (admin) {
+            for (Set<URL> providers : new HashSet<Set<URL>>(received.values())) {
+                for (URL url : new HashSet<URL>(providers)) {
+                    if (isExpired(url)) {
+                        if (logger.isWarnEnabled()) {
+                            logger.warn("Clean expired provider " + url);
+                        }
+                        doUnregister(url);
+                    }
+                }
+            }
+        }
+    }
+   
+    private void receive(String msg, InetSocketAddress remoteAddress) {
+        if (logger.isInfoEnabled()) {
+            logger.info("Receive multicast message: " + msg + " from " + remoteAddress);
+        }
+        if (msg.startsWith(Constants.REGISTER)) {
+            URL url = URL.valueOf(msg.substring(Constants.REGISTER.length()).trim());
+            registered(url);
+        } else if (msg.startsWith(Constants.UNREGISTER)) {
+            URL url = URL.valueOf(msg.substring(Constants.UNREGISTER.length()).trim());
+            unregistered(url);
+        } else if (msg.startsWith(Constants.SUBSCRIBE)) {
+            //消费者订阅时
+            //consumer://10.6.1.250/com.alibaba.dubbo.examples.validation.api.ValidationService?application=validation-consumer&category=providers,configurators,routers&dubbo=2.0.2&interface=com.alibaba.dubbo.examples.validation.api.ValidationService&methods=save,update,delete&pid=244128&side=consumer&timestamp=1574755164222&validation=true
+            URL url = URL.valueOf(msg.substring(Constants.SUBSCRIBE.length()).trim());
+            //提供者的已注册数据
+            // dubbo://10.6.1.250:20880/com.alibaba.dubbo.examples.validation.api.ValidationService?accesslog=true&anyhost=true&application=validation-provider&bean.name=com.alibaba.dubbo.examples.validation.api.ValidationService&compiler=jdk&dubbo=2.0.2&generic=false&interface=com.alibaba.dubbo.examples.validation.api.ValidationService&methods=save,update,delete&pid=154884&side=provider&timestamp=1574754854128
+            Set<URL> urls = getRegistered();
+            if (urls != null && !urls.isEmpty()) {
+                for (URL u : urls) {
+                    //url为consumer时，u为提供者时（如dubbo）
+                    if (UrlUtils.isMatch(url, u)) {
+                        //127.0.0.1 消费者和提供者在一台机器上时
+                        String host = remoteAddress != null && remoteAddress.getAddress() != null
+                                ? remoteAddress.getAddress().getHostAddress() : url.getIp();
+                        //单播发送（消费者和提供者不在一台机器上并消费者机器只有一个消费者）
+                        if (url.getParameter("unicast", true) // Whether the consumer's machine has only one process
+                                && !NetUtils.getLocalHost().equals(host)) { // Multiple processes in the same machine cannot be unicast with unicast or there will be only one process receiving information
+                            unicast(Constants.REGISTER + " " + u.toFullString(), host);
+                        } else {
+                           //组播发送 （消费者和提供者在一台机器上时）
+                            broadcast(Constants.REGISTER + " " + u.toFullString());
+                        }
+                    }
+                }
+            }
+        }/* else if (msg.startsWith(UNSUBSCRIBE)) {
+        }*/
+    }
+    //组播发送（如224.5.6.7:1234组都能收到信息）
+    private void broadcast(String msg) {
+        if (logger.isInfoEnabled()) {
+            logger.info("Send broadcast message: " + msg + " to " + multicastAddress + ":" + multicastPort);
+        }
+        try {
+            byte[] data = (msg + "\n").getBytes();
+            DatagramPacket hi = new DatagramPacket(data, data.length, multicastAddress, multicastPort);
+            multicastSocket.send(hi);
+        } catch (Exception e) {
+            throw new IllegalStateException(e.getMessage(), e);
+        }
+    }
+    //单播发送（指定host地址和端口）
+    private void unicast(String msg, String host) {
+        if (logger.isInfoEnabled()) {
+            logger.info("Send unicast message: " + msg + " to " + host + ":" + multicastPort);
+        }
+        try {
+            byte[] data = (msg + "\n").getBytes();
+            DatagramPacket hi = new DatagramPacket(data, data.length, InetAddress.getByName(host), multicastPort);
+            multicastSocket.send(hi);
+        } catch (Exception e) {
+            throw new IllegalStateException(e.getMessage(), e);
+        }
+    }
+    
+    //注册实现，组播发送 如 
+    // 
+    @Override
+    protected void doRegister(URL url) {
+        broadcast(Constants.REGISTER + " " + url.toFullString());
+    }
+    @Override
+    protected void doUnregister(URL url) {
+        broadcast(Constants.UNREGISTER + " " + url.toFullString());
+    }
+    //订阅实现，组播发送 如 
+    //  subscribe consumer://10.6.1.250/com.alibaba.dubbo.examples.validation.api.ValidationService?application=validation-consumer&category=providers,configurators,routers&dubbo=2.0.2&interface=com.alibaba.dubbo.examples.validation.api.ValidationService&methods=save,update,delete&pid=244128&side=consumer&timestamp=1574755164222&validation=true
+    @Override
+    protected void doSubscribe(URL url, NotifyListener listener) {
+        if (Constants.ANY_VALUE.equals(url.getServiceInterface())) {
+            admin = true;
+        }
+        broadcast(Constants.SUBSCRIBE + " " + url.toFullString());
+        synchronized (listener) {
+            try {
+                listener.wait(url.getParameter(Constants.TIMEOUT_KEY, Constants.DEFAULT_TIMEOUT));
+            } catch (InterruptedException e) {
+            }
+        }
+    }
+    ...
+    protected void registered(URL url) {
+        for (Map.Entry<URL, Set<NotifyListener>> entry : getSubscribed().entrySet()) {
+            URL key = entry.getKey();
+            if (UrlUtils.isMatch(key, url)) {
+                Set<URL> urls = received.get(key);
+                if (urls == null) {
+                    received.putIfAbsent(key, new ConcurrentHashSet<URL>());
+                    urls = received.get(key);
+                }
+                urls.add(url);
+                List<URL> list = toList(urls);
+                for (NotifyListener listener : entry.getValue()) {
+                    notify(key, listener, list);
+                    synchronized (listener) {
+                        listener.notify();
+                    }
+                }
+            }
+        }
+    }
+   ...
+}
+
+```
+
 
 ## 3.4 dubbo注册中心-Redis实现分析
+
+- Redis介绍
+
+ ![duddo中Redis注册中心](pic/dubbo-Registry-Redis.png)
+ 
+
+```aidl
+使用 Redis 的 Key/Map 结构存储数据结构：
+    主 Key 为服务名和类型
+    Map 中的 Key 为 URL 地址
+    Map 中的 Value 为过期时间，用于判断脏数据，脏数据由监控中心删除 [3]
+使用 Redis 的 Publish/Subscribe 事件通知数据变更：
+    通过事件的值区分事件类型：register, unregister, subscribe, unsubscribe
+    普通消费者直接订阅指定服务提供者的 Key，只会收到指定服务的 register, unregister 事件
+    监控中心通过 psubscribe 功能订阅 /dubbo/*，会收到所有服务的所有变更事件
+调用过程：
+    服务提供方启动时，向 Key:/dubbo/com.foo.BarService/providers 下，添加当前提供者的地址
+    并向 Channel:/dubbo/com.foo.BarService/providers 发送 register 事件
+    服务消费方启动时，从 Channel:/dubbo/com.foo.BarService/providers 订阅 register 和 unregister 事件
+    并向 Key:/dubbo/com.foo.BarService/consumers 下，添加当前消费者的地址
+    服务消费方收到 register 和 unregister 事件后，从 Key:/dubbo/com.foo.BarService/providers 下获取提供者地址列表
+    服务监控中心启动时，从 Channel:/dubbo/* 订阅 register 和 unregister，以及 subscribe 和unsubsribe事件
+    服务监控中心收到 register 和 unregister 事件后，从 Key:/dubbo/com.foo.BarService/providers 下获取提供者地址列表
+    服务监控中心收到 subscribe 和 unsubsribe 事件后，从 Key:/dubbo/com.foo.BarService/consumers 下获取消费者地址列表
+    
+    
+
+```
+
 
 
 # 四、其他

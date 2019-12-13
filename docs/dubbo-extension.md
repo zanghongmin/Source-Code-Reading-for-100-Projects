@@ -274,21 +274,23 @@ private final ExtensionFactory objectFactory;
 private final ConcurrentMap<Class<?>, String> cachedNames = new ConcurrentHashMap<Class<?>, String>();
 -- 名称对应实现类 如 "registry" -> "class com.alibaba.dubbo.registry.integration.RegistryProtocol"
 private final Holder<Map<String, Class<?>>> cachedClasses = new Holder<Map<String, Class<?>>>();
--- 
+-- 名称对应实现类上的Activate注解，如interface com.alibaba.dubbo.rpc.Filter SPI接口的有10多个
+//0 = {ConcurrentHashMap$MapEntry@3264} "exception" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=0, group=[provider])"
+//1 = {ConcurrentHashMap$MapEntry@3265} "cache" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[cache], order=0, group=[consumer, provider])"
 private final Map<String, Activate> cachedActivates = new ConcurrentHashMap<String, Activate>();
 -- 名称对应实现类的实例 如 "dubbo" -> ProtocolFilterWrapper实例
 private final ConcurrentMap<String, Holder<Object>> cachedInstances = new ConcurrentHashMap<String, Holder<Object>>();
--- 
+-- 一个SPI接口对应一个自适应适配类实例
 private final Holder<Object> cachedAdaptiveInstance = new Holder<Object>();
--- 
+-- 一个自适应适配class类
 private volatile Class<?> cachedAdaptiveClass = null;
 -- @SPI扩展接口类默认使用实现类名称 ，如com.alibaba.dubbo.rpc.Protocol 的 dubbo
 private String cachedDefaultName;
--- 
+-- 创建自适应适配类时出现的异常
 private volatile Throwable createAdaptiveInstanceError;
 -- @SPI扩展接口类 其实现类中是包裹类的集合 ，如com.alibaba.dubbo.rpc.Protocol 的包裹类有QosProtocolWrapper  ProtocolFilterWrapper ProtocolListenerWrapper3个
 private Set<Class<?>> cachedWrapperClasses;
--- 
+-- SPI接口名称对应加载器实现类时出现的异常
 private Map<String, IllegalStateException> exceptions = new ConcurrentHashMap<String, IllegalStateException>();
 ```
 
@@ -985,7 +987,166 @@ dubbo动态编译compile介绍
 
 - ExtensionLoader介绍 - 获取集合类扩展
 
+```aidl
+以ProtocolFilterWrapper类中export的为例
 
+//服务提供方 - 暴露方法export
+@Override
+public <T> Exporter<T> export(Invoker<T> invoker) throws RpcException {
+    if (Constants.REGISTRY_PROTOCOL.equals(invoker.getUrl().getProtocol())) {
+        return protocol.export(invoker);
+    }
+    return protocol.export(buildInvokerChain(invoker, Constants.SERVICE_FILTER_KEY, Constants.PROVIDER));
+}
+
+//invoker为具体的提供服务实现类 ，key为service.filter，group为provider
+//过滤器链，有多个过滤器，合并成一个，按前后顺序返回给调用
+ private static <T> Invoker<T> buildInvokerChain(final Invoker<T> invoker, String key, String group) {
+        Invoker<T> last = invoker;
+        //获取过滤器Filter.class的多个实现
+        List<Filter> filters = ExtensionLoader.getExtensionLoader(Filter.class).getActivateExtension(invoker.getUrl(), key, group);
+        if (!filters.isEmpty()) {
+            //按顺序，一个个顺序调用filter.invoke(next, invocation);
+            for (int i = filters.size() - 1; i >= 0; i--) {
+                final Filter filter = filters.get(i);
+                final Invoker<T> next = last;
+                last = new Invoker<T>() {
+                    @Override
+                    public Class<T> getInterface() {
+                        return invoker.getInterface();
+                    }
+                    @Override
+                    public URL getUrl() {
+                        return invoker.getUrl();
+                    }
+                    @Override
+                    public boolean isAvailable() {
+                        return invoker.isAvailable();
+                    }
+                    @Override
+                    public Result invoke(Invocation invocation) throws RpcException {
+                        return filter.invoke(next, invocation);
+                    }
+                    @Override
+                    public void destroy() {
+                        invoker.destroy();
+                    }
+                    @Override
+                    public String toString() {
+                        return invoker.toString();
+                    }
+                };
+            }
+        }
+        return last;
+    }
+
+
+List<Filter> filters = ExtensionLoader.getExtensionLoader(Filter.class).getActivateExtension(invoker.getUrl(), key, group);
+    url为dubbo://10.6.1.250:20880/com.alibaba.dubbo.examples.validation.api.ValidationService?anyhost=true&application=validation-provider&bean.name=com.alibaba.dubbo.examples.validation.api.ValidationService&bind.ip=10.6.1.250&bind.port=20880&compiler=jdk&dubbo=2.0.2&generic=false&interface=com.alibaba.dubbo.examples.validation.api.ValidationService&methods=save,update,delete&pid=186932&side=provider&timestamp=1574652776591&validation=true
+    key为service.filter
+    group为provider
+        
+getActivateExtension分析过程
+    public List<T> getActivateExtension(URL url, String key, String group) {
+        //从url获取配置的key的值，如<dubbo:service filter="xxx,default,yyy" />    
+        //其中xxx和yyy为自定义的扩展，default为默认的dubbo实现的 ， 顺序为xxx在前，default，最后yyy
+        //http://dubbo.apache.org/zh-cn/docs/dev/impls/filter.html
+        // key中有-时，表示去掉这扩展，-default表示去掉所有默认的dubbo实现的扩展
+        String value = url.getParameter(key);
+        return getActivateExtension(url, value == null || value.length() == 0 ? null : Constants.COMMA_SPLIT_PATTERN.split(value), group);
+    }
+    // values为空，group为provider
+    public List<T> getActivateExtension(URL url, String[] values, String group) {
+        List<T> exts = new ArrayList<T>();
+        List<String> names = values == null ? new ArrayList<String>(0) : Arrays.asList(values);
+        //names不包含-default时，走dubbo默认实现的扩展
+        if (!names.contains(Constants.REMOVE_VALUE_PREFIX + Constants.DEFAULT_KEY)) {
+            //加载SPI类（Filter.class）的所有已实现类
+            getExtensionClasses();
+            //cachedActivates为执行getExtensionClasses();后缓存的SPI实现类名称和其注解Activate对应，如Filter.class有下面18个实现类的注解Activate对应
+            //0 = {ConcurrentHashMap$MapEntry@3264} "exception" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=0, group=[provider])"
+            //1 = {ConcurrentHashMap$MapEntry@3265} "cache" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[cache], order=0, group=[consumer, provider])"
+            //2 = {ConcurrentHashMap$MapEntry@3266} "genericimpl" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[generic], order=20000, group=[consumer])"
+            //3 = {ConcurrentHashMap$MapEntry@3267} "deprecated" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[deprecated], order=0, group=[consumer])"
+            //4 = {ConcurrentHashMap$MapEntry@3268} "classloader" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=-30000, group=[provider])"
+            //5 = {ConcurrentHashMap$MapEntry@3269} "echo" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=-110000, group=[provider])"
+            //6 = {ConcurrentHashMap$MapEntry@3270} "monitor" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=0, group=[provider, consumer])"
+            //7 = {ConcurrentHashMap$MapEntry@3271} "generic" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=-20000, group=[provider])"
+            //8 = {ConcurrentHashMap$MapEntry@3272} "timeout" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=0, group=[provider])"
+            //9 = {ConcurrentHashMap$MapEntry@3273} "accesslog" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[accesslog], order=0, group=[provider])"
+            //10 = {ConcurrentHashMap$MapEntry@3274} "token" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[token], order=0, group=[provider])"
+            //11 = {ConcurrentHashMap$MapEntry@3275} "trace" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=0, group=[provider])"
+            //12 = {ConcurrentHashMap$MapEntry@3276} "executelimit" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[executes], order=0, group=[provider])"
+            //13 = {ConcurrentHashMap$MapEntry@3277} "future" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=0, group=[consumer])"
+            //14 = {ConcurrentHashMap$MapEntry@3278} "context" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=-10000, group=[provider])"
+            //15 = {ConcurrentHashMap$MapEntry@3279} "activelimit" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[actives], order=0, group=[consumer])"
+            //16 = {ConcurrentHashMap$MapEntry@3280} "validation" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[validation], order=10000, group=[consumer, provider])"
+            //17 = {ConcurrentHashMap$MapEntry@3281} "consumercontext" -> "@com.alibaba.dubbo.common.extension.Activate(after=[], before=[], value=[], order=-10000, group=[consumer])"
+            for (Map.Entry<String, Activate> entry : cachedActivates.entrySet()) {
+                String name = entry.getKey();
+                Activate activate = entry.getValue();
+                //根据注解activate组信息，判断是否加载该类
+                if (isMatchGroup(group, activate.group())) {
+                    T ext = getExtension(name);
+                     // isActive(activate, url) ，注解activate中value有值的话，还需要根据URL的参数判断是否加载   
+                     // 如 URL的sevice配置了accesslog="true"，那么ext中就会加载 {AccessLogFilter@3422} 
+                    if (!names.contains(name)
+                            && !names.contains(Constants.REMOVE_VALUE_PREFIX + name)
+                            && isActive(activate, url)) {
+                        exts.add(ext);
+                    }
+                }
+            }
+            //过滤后exts，SPI类（Filter.class）的所有已实现类 , provider端需要加载的
+            //0 = {ExceptionFilter@3974} 
+            //1 = {ClassLoaderFilter@3975} 
+            //2 = {EchoFilter@3976} 
+            //3 = {MonitorFilter@3977} 
+            //4 = {GenericFilter@3978} 
+            //5 = {TimeoutFilter@3979} 
+            //6 = {TraceFilter@3980} 
+            //7 = {ContextFilter@3981} 
+            //8 = {ValidationFilter@3982} 
+            //下面是排序exts，使用时按顺序调用这些类
+            //0 = {EchoFilter@3976} 
+            //1 = {ClassLoaderFilter@3975} 
+            //2 = {GenericFilter@3978} 
+            // 3 = {ContextFilter@3981} 
+            //4 = {TraceFilter@3980} 
+            //5 = {TimeoutFilter@3979} 
+            //6 = {MonitorFilter@3977} 
+            //7 = {ExceptionFilter@3974} 
+            //8 = {ValidationFilter@3982}          
+            Collections.sort(exts, ActivateComparator.COMPARATOR);
+        }
+        List<T> usrs = new ArrayList<T>();
+        for (int i = 0; i < names.size(); i++) {
+            String name = names.get(i);
+            if (!name.startsWith(Constants.REMOVE_VALUE_PREFIX)
+                    && !names.contains(Constants.REMOVE_VALUE_PREFIX + name)) {
+                if (Constants.DEFAULT_KEY.equals(name)) {
+                    if (!usrs.isEmpty()) {
+                        exts.addAll(0, usrs);
+                        usrs.clear();
+                    }
+                } else {
+                    T ext = getExtension(name);
+                    usrs.add(ext);
+                }
+            }
+        }
+        if (!usrs.isEmpty()) {
+            exts.addAll(usrs);
+        }
+        return exts;
+    }
+
+
+
+
+
+```
 
 
 

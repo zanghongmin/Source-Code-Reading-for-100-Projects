@@ -26,7 +26,9 @@
         > 注册中心，多种实现方式，推荐使用zookeeper       
     - [Dubbo-Monitor](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/dubbo-Monitor.md)  
         > 监控中心      
-
+      - [dubbo-remoting](https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/dubbo-remoting.md)  
+          > dubbo 连接远程地址如zookeeper,natty，mina等，封装的连接模块
+                
 
 
 
