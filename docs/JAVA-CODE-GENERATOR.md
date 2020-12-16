@@ -29,7 +29,7 @@ Jdk1.7+
 
 # 二、项目使用
 
-<img src="https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/Source-Code-Reading-for-100-Projects/pic/JAVA-CODE-Generator-use.png" width="200" height="200" alt="微信小程序"/><br/
+<img src="https://github.com/zanghongmin/Source-Code-Reading-for-100-Projects/blob/master/docs/pic/JAVA-CODE-Generator-use.png" width="200" height="200" alt="微信小程序"/><br/
 ![总体架构图](pic/JAVA-CODE-Generator-use.png)
 
 - 输入建表语句，点击响应按钮，生成各个类
